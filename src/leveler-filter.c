@@ -219,6 +219,25 @@ static const char *trim_setting_for_mode(uint32_t mode)
 	}
 }
 
+static void set_custom_properties_visible(obs_properties_t *properties, bool visible)
+{
+	static const char *const setting_names[] = {SETTING_TARGET_LUFS, SETTING_MAX_BOOST, SETTING_MAX_REDUCTION,
+						    SETTING_ATTACK, SETTING_RELEASE};
+	for (size_t i = 0; i < sizeof(setting_names) / sizeof(setting_names[0]); i++) {
+		obs_property_t *property = obs_properties_get(properties, setting_names[i]);
+		if (property)
+			obs_property_set_visible(property, visible);
+	}
+}
+
+static bool leveler_mode_modified(obs_properties_t *properties, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	const bool custom = mode_from_string(obs_data_get_string(settings, SETTING_MODE)) == LVB_MODE_CUSTOM;
+	set_custom_properties_visible(properties, custom);
+	return true;
+}
+
 static void leveler_register_instance(struct leveler_filter_data *filter)
 {
 	INSTANCES_LOCK();
@@ -638,9 +657,9 @@ static struct obs_audio_data *leveler_filter_audio(void *opaque, struct obs_audi
 	return audio;
 }
 
-static obs_properties_t *leveler_properties(void *unused)
+static obs_properties_t *leveler_properties(void *data)
 {
-	UNUSED_PARAMETER(unused);
+	const struct leveler_filter_data *filter = data;
 	obs_properties_t *properties = obs_properties_create();
 	obs_property_t *property;
 	obs_properties_add_bool(properties, SETTING_BYPASS, obs_module_text("Bypass"));
@@ -652,6 +671,7 @@ static obs_properties_t *leveler_properties(void *unused)
 	obs_property_list_add_string(property, obs_module_text("ModeSermon"), "sermon");
 	obs_property_list_add_string(property, obs_module_text("ModeCustom"), "custom");
 	obs_property_list_add_string(property, obs_module_text("ModeAutoAssist"), "auto_assist");
+	obs_property_set_modified_callback(property, leveler_mode_modified);
 
 	property = obs_properties_add_float_slider(properties, SETTING_TARGET_LUFS, obs_module_text("CustomTarget"),
 						   -30.0, -9.0, 0.5);
@@ -675,6 +695,7 @@ static obs_properties_t *leveler_properties(void *unused)
 	obs_property_float_set_suffix(property, " dBTP est.");
 	obs_properties_add_text(properties, "mode_note", obs_module_text("ModeNote"), OBS_TEXT_INFO);
 	obs_properties_add_text(properties, "dock_note", obs_module_text("DockNote"), OBS_TEXT_INFO);
+	set_custom_properties_visible(properties, filter && lvb_atomic_load(&filter->mode) == LVB_MODE_CUSTOM);
 	return properties;
 }
 
