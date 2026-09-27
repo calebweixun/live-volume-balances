@@ -19,6 +19,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#include "monitor-bridge.h"
+
 extern struct obs_source_info live_volume_balancer_filter;
 
 OBS_DECLARE_MODULE()
@@ -27,11 +29,13 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 bool obs_module_load(void)
 {
 	obs_register_source(&live_volume_balancer_filter);
+	lvb_monitor_dock_load();
 	obs_log(LOG_INFO, "Live Volume Balancer loaded (version %s)", PLUGIN_VERSION);
 	return true;
 }
 
 void obs_module_unload(void)
 {
+	lvb_monitor_dock_unload();
 	obs_log(LOG_INFO, "Live Volume Balancer unloaded");
 }
