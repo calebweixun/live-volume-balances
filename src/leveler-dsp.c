@@ -64,7 +64,7 @@ static float energy_to_lufs(double energy)
 {
 	if (!isfinite(energy) || energy <= 1e-12)
 		return -120.0f;
-	return LVB_LUFS_OFFSET + 10.0f * (float)log10(energy);
+	return (float)(LVB_LUFS_OFFSET + 10.0 * log10(energy));
 }
 
 static void configure_k_weighting(struct lvb_state *state, float sample_rate)
