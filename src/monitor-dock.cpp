@@ -228,6 +228,20 @@ public:
 		setMaximumHeight(12);
 		setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 		setToolTip(localized("GainBarHelp"));
+		m_tooltip = localized("GainBarHelp");
+	}
+
+	const QString &setAdvancedSettingsTooltip(float fader_smoothness, float quiet_attenuation_db)
+	{
+		const QString next_tooltip = localized("GainBarHelp") + QStringLiteral("\n") +
+					     localized("GainAdvancedSettingsTooltipFormat")
+						     .arg(fader_smoothness, 0, 'f', 0)
+						     .arg(quiet_attenuation_db, 0, 'f', 1);
+		if (m_tooltip != next_tooltip) {
+			m_tooltip = next_tooltip;
+			setToolTip(m_tooltip);
+		}
+		return m_tooltip;
 	}
 
 	void setReading(float gain_db, float maximum_reduction_db, float maximum_boost_db)
@@ -291,6 +305,7 @@ protected:
 	}
 
 private:
+	QString m_tooltip;
 	float m_gain_db = 0.0f;
 	float m_maximum_reduction_db = 18.0f;
 	float m_maximum_boost_db = 18.0f;
@@ -488,6 +503,10 @@ public:
 		set_label_text(m_gain_value, gain_text);
 		m_gain_meter->setReading(stats.gain_db, stats.max_reduction_db, stats.max_boost_db);
 		m_gain_meter->setBypassed(stats.bypass);
+		const QString &gain_tooltip =
+			m_gain_meter->setAdvancedSettingsTooltip(stats.fader_smoothness, stats.quiet_attenuation_db);
+		if (m_gain_value->toolTip() != gain_tooltip)
+			m_gain_value->setToolTip(gain_tooltip);
 		set_label_text(m_gain_minimum,
 			       localized("GainRangeMinimumFormat").arg(stats.max_reduction_db, 0, 'f', 1));
 		set_label_text(m_gain_maximum, localized("GainRangeMaximumFormat").arg(stats.max_boost_db, 0, 'f', 1));

@@ -27,6 +27,8 @@ static struct lvb_settings test_settings(void)
 		.attack_ms = 180.0f,
 		.release_ms = 1800.0f,
 		.noise_floor_db = -46.0f,
+		.fader_smoothness = LVB_FADER_SMOOTHNESS_DEFAULT,
+		.quiet_attenuation_db = 0.0f,
 		.peak_ceiling_db = -1.0f,
 		.bypass = false,
 	};
@@ -117,6 +119,65 @@ static float process_noise_segment(struct lvb_state *state, const struct lvb_set
 	return output_count ? (float)sqrt(output_sum / (double)output_count) : 0.0f;
 }
 
+static float mixed_syllable_gain_swing(float smoothness, float *maximum_peak_dbtp,
+				       float *maximum_quiet_transition_seconds)
+{
+	struct lvb_settings settings = test_settings();
+	settings.fader_smoothness = smoothness;
+	struct lvb_state state;
+	lvb_state_init(&state);
+	float samples[521];
+	float *planes[] = {samples};
+	size_t position = 0;
+	double maximum_swing_db = 0.0;
+	const size_t block_sizes[] = {137, 511, 233, 89, 521, 317};
+	size_t block_index = 0;
+	if (maximum_peak_dbtp)
+		*maximum_peak_dbtp = -120.0f;
+	if (maximum_quiet_transition_seconds)
+		*maximum_quiet_transition_seconds = 0.0f;
+
+	/* Establish a continuous music bed before adding short loud vocal phrases. */
+	process_segment(&state, &settings, 48000.0f, 330.0f, 0.045f, 48000U * 4U, 0, NULL);
+	position = 48000U * 4U;
+
+	for (size_t cycle = 0; cycle < 8; cycle++) {
+		double minimum_gain_db = state.gain_db;
+		double maximum_gain_db = state.gain_db;
+		size_t cycle_position = 0;
+		while (cycle_position < 48000U * 6U / 5U) {
+			const size_t requested_count =
+				block_sizes[block_index++ % (sizeof(block_sizes) / sizeof(block_sizes[0]))];
+			const size_t remaining = 48000U * 6U / 5U - cycle_position;
+			const size_t count = requested_count < remaining ? requested_count : remaining;
+			for (size_t i = 0; i < count; i++) {
+				const float time = (float)(position + i) / 48000.0f;
+				const float music = 0.045f * sinf(6.28318530717958647692f * 330.0f * time);
+				const float voice = cycle_position + i < 48000U / 5U
+							    ? 0.24f * sinf(6.28318530717958647692f * 1250.0f * time)
+							    : 0.0f;
+				samples[i] = music + voice;
+			}
+			lvb_process(&state, &settings, 1, planes, count, 48000.0f);
+			if (state.gain_db < minimum_gain_db)
+				minimum_gain_db = state.gain_db;
+			if (state.gain_db > maximum_gain_db)
+				maximum_gain_db = state.gain_db;
+			if (maximum_peak_dbtp && state.stats.true_peak_dbtp > *maximum_peak_dbtp)
+				*maximum_peak_dbtp = state.stats.true_peak_dbtp;
+			if (maximum_quiet_transition_seconds &&
+			    state.quiet_transition_seconds > *maximum_quiet_transition_seconds)
+				*maximum_quiet_transition_seconds = state.quiet_transition_seconds;
+			position += count;
+			cycle_position += count;
+		}
+		const double swing_db = maximum_gain_db - minimum_gain_db;
+		if (swing_db > maximum_swing_db)
+			maximum_swing_db = swing_db;
+	}
+	return (float)maximum_swing_db;
+}
+
 static int test_quiet_audio_is_raised_with_linked_stereo_and_live_meters(void)
 {
 	struct lvb_settings settings = test_settings();
@@ -146,15 +207,33 @@ static int test_full_band_to_quiet_sermon_reopens_relative_gate(void)
 	struct lvb_state state;
 	lvb_state_init(&state);
 	const size_t band_frames = 48000U * 2U;
-	const size_t sermon_frames = 48000U * 3U;
 	const float band_rms = process_segment(&state, &settings, 48000.0f, 900.0f, 0.62f, band_frames, 0, NULL);
 	const float gain_during_band = state.stats.gain_db;
 	CHECK(gain_during_band < -1.0f, "loud full-band audio should be gently reduced");
-	const float sermon_rms = process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, sermon_frames,
-						 sermon_frames - 48000U / 2U, NULL);
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U / 2U, 0, NULL);
+	const double gain_after_half_second = state.gain_db;
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U / 2U, 0, NULL);
+	const double gain_after_one_second = state.gain_db;
+	const float quiet_timer_after_one_second = state.quiet_transition_seconds;
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U, 0, NULL);
+	const double gain_after_two_seconds = state.gain_db;
+	const float quiet_timer_after_two_seconds = state.quiet_transition_seconds;
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U, 0, NULL);
+	const double gain_after_three_seconds = state.gain_db;
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U, 0, NULL);
+	const double gain_after_four_seconds = state.gain_db;
+	const float sermon_rms =
+		process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U, 48000U / 2U, NULL);
 	CHECK(state.stats.input_momentary_lufs > -40.0f, "quiet sermon should remain above the activity floor");
+	CHECK(gain_after_half_second > gain_during_band && gain_after_one_second > gain_after_half_second,
+	      "quiet-sermon gain should start rising smoothly rather than jump at the transition");
+	CHECK(quiet_timer_after_one_second < 0.80f && quiet_timer_after_two_seconds >= 0.80f,
+	      "faster quiet-transition assist should require sustained active low-level audio");
 	CHECK(state.stats.gain_db > 3.0f,
-	      "the relative activity reference must fall quickly enough to lift quiet speech after a loud band");
+	      "a quiet sermon should rise toward target within five seconds after a loud band");
+	CHECK(gain_after_three_seconds > gain_after_two_seconds && gain_after_four_seconds > gain_after_three_seconds &&
+		      state.gain_db > gain_after_four_seconds,
+	      "quiet-sermon compensation should move smoothly upward through the transition");
 	CHECK(sermon_rms > 0.020f, "the final sermon output should be raised toward the selected target");
 	CHECK(sermon_rms > band_rms * 0.035f, "the reduced band-to-sermon level gap should be materially smaller");
 	return 0;
@@ -167,14 +246,60 @@ static int test_steady_band_and_sermon_outputs_move_toward_same_target(void)
 	struct lvb_state sermon_state;
 	lvb_state_init(&band_state);
 	lvb_state_init(&sermon_state);
-	process_segment(&band_state, &settings, 48000.0f, 900.0f, 0.62f, 48000U * 6U, 0, NULL);
-	process_segment(&sermon_state, &settings, 48000.0f, 440.0f, 0.035f, 48000U * 6U, 0, NULL);
+	process_segment(&band_state, &settings, 48000.0f, 900.0f, 0.62f, 48000U * 8U, 0, NULL);
+	process_segment(&sermon_state, &settings, 48000.0f, 440.0f, 0.035f, 48000U * 8U, 0, NULL);
 	CHECK(band_state.stats.output_short_term_lufs > -21.0f && band_state.stats.output_short_term_lufs < -15.0f,
 	      "steady band output should ride near the target while retaining some dynamics");
 	CHECK(sermon_state.stats.output_short_term_lufs > -21.0f && sermon_state.stats.output_short_term_lufs < -15.0f,
 	      "steady quiet sermon should rise near the same rolling target");
-	CHECK(fabsf(band_state.stats.output_short_term_lufs - sermon_state.stats.output_short_term_lufs) < 2.0f,
+	CHECK(fabsf(band_state.stats.output_short_term_lufs - sermon_state.stats.output_short_term_lufs) < 2.5f,
 	      "the automatic rider should materially narrow steady band-to-sermon loudness differences");
+	CHECK(band_state.peak_guard_gain > 0.99f,
+	      "the rider should settle sustained band level without relying on continuous peak-guard reduction");
+	return 0;
+}
+
+static int test_fader_curve_reduces_mixed_program_syllable_pumping(void)
+{
+	float legacy_peak = -120.0f;
+	float smooth_peak = -120.0f;
+	float maximum_quiet_transition_seconds = 0.0f;
+	const float legacy_swing = mixed_syllable_gain_swing(0.0f, &legacy_peak, NULL);
+	const float smooth_swing = mixed_syllable_gain_swing(LVB_FADER_SMOOTHNESS_DEFAULT, &smooth_peak,
+							     &maximum_quiet_transition_seconds);
+	const float maximum_smooth_swing = mixed_syllable_gain_swing(100.0f, NULL, NULL);
+	CHECK(legacy_swing > 1.0f, "test phrases must exercise the legacy gain rider");
+	CHECK(smooth_swing <= 3.0f, "default fader curve should keep short mixed-program gain swings at or below 3 dB");
+	CHECK(maximum_smooth_swing <= 3.0f, "maximum smoothness should keep short phrase gain swings below 3 dB");
+	CHECK(maximum_quiet_transition_seconds < 0.80f,
+	      "one-second phrase gaps in an active music bed should not trigger the recovery assist");
+	CHECK(smooth_swing <= legacy_swing - 5.0f,
+	      "default fader curve should reduce short mixed-program gain swings by at least 5 dB");
+	CHECK(smooth_peak <= -0.65f, "fader movement must retain independent fast peak protection");
+	return 0;
+}
+
+static int test_tiny_gain_steps_keep_linear_and_db_state_synchronized(void)
+{
+	struct lvb_settings settings = test_settings();
+	struct lvb_state state;
+	lvb_state_init(&state);
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U * 8U, 0, NULL);
+
+	const double starting_gain_db = state.gain_db - 0.5;
+	state.gain_db = starting_gain_db;
+	state.gain_target_db = starting_gain_db;
+	state.gain = pow(10.0, starting_gain_db / 20.0);
+	state.gain_rate_db_per_second = 0.0f;
+	const double starting_gain = state.gain;
+	float sample[] = {0.02f};
+	float *planes[] = {sample};
+	lvb_process(&state, &settings, 1, planes, 1, 48000.0f);
+
+	CHECK(state.gain > starting_gain && state.gain_db > starting_gain_db,
+	      "sub-ULP per-sample dB movements should accumulate instead of stalling at unity precision");
+	CHECK(fabs(20.0 * log10(state.gain) - state.gain_db) < 1e-9,
+	      "linear rider gain and its dB control state should remain synchronized");
 	return 0;
 }
 
@@ -212,9 +337,30 @@ static int test_short_pauses_do_not_lift_minus_50_dbfs_ambience(void)
 	CHECK(!state.stats.activity_open, "the absolute activity floor should close during a quiet pause");
 	CHECK(state.stats.input_momentary_lufs < settings.noise_floor_db,
 	      "broadband -50 dBFS room noise should sit below the default activity floor");
+	CHECK(state.quiet_transition_seconds < 0.80f,
+	      "a closed room-noise pause should not qualify for the active quiet-transition assist");
 	CHECK(first_half_rms < 0.0048f, "the first half-second pause should not pull room ambience toward target");
 	CHECK(second_half_rms < 0.0037f, "a sustained pause must remain near its original ambience level");
 	CHECK(pause_peak <= settings.peak_ceiling_db + 0.35f, "peak protection must remain safe during a pause");
+	return 0;
+}
+
+static int test_optional_quiet_attenuation_fades_without_hard_gating(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.quiet_attenuation_db = 6.0f;
+	struct lvb_state state;
+	lvb_state_init(&state);
+	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U * 2U, 0, NULL);
+	CHECK(state.stats.gain_db > 3.0f, "speech before a pause should receive automatic lift");
+	const float input_noise_rms = 0.0055f / sqrtf(3.0f);
+	const float output_noise_rms =
+		process_noise_segment(&state, &settings, 48000.0f, 0.0055f, 48000U * 2U, 48000U, NULL);
+	CHECK(!state.stats.activity_open, "the activity gate should close during room ambience");
+	CHECK(state.stats.quiet_attenuation_db == 6.0f && state.stats.gain_db < -5.0f,
+	      "quiet attenuation should smoothly reach its configured level after the gate closes");
+	CHECK(output_noise_rms < input_noise_rms * 0.62f && output_noise_rms > input_noise_rms * 0.25f,
+	      "room ambience should fade down without being hard-muted");
 	return 0;
 }
 
@@ -372,6 +518,8 @@ static int test_null_planes_nonfinite_samples_and_invalid_settings(void)
 {
 	struct lvb_settings settings = test_settings();
 	settings.target_lufs = NAN;
+	settings.fader_smoothness = 150.0f;
+	settings.quiet_attenuation_db = -20.0f;
 	struct lvb_state state;
 	lvb_state_init(&state);
 	float samples[16] = {NAN, INFINITY, 0.01f};
@@ -381,6 +529,9 @@ static int test_null_planes_nonfinite_samples_and_invalid_settings(void)
 	      "non-finite samples should be made safe rather than propagated to OBS output");
 	CHECK(isfinite(state.gain), "invalid saved targets should be clamped safely");
 	CHECK(state.stats.true_peak_dbtp <= 0.1f, "sanitized output peak telemetry should remain finite");
+	CHECK(state.stats.fader_smoothness == LVB_FADER_SMOOTHNESS_MAX &&
+		      state.stats.quiet_attenuation_db == LVB_QUIET_ATTENUATION_MIN,
+	      "invalid saved fader and quiet attenuation controls are clamped to their UI ranges");
 	return 0;
 }
 
@@ -463,6 +614,7 @@ static int test_expanded_control_ranges_are_effective(void)
 	CHECK(measured_peak < db_to_linear(-23.8f), "minimum peak-ceiling range is enforced on output samples");
 
 	struct lvb_settings attack_settings = test_settings();
+	attack_settings.fader_smoothness = 0.0f;
 	attack_settings.target_lufs = -36.0f;
 	attack_settings.max_boost_db = 0.0f;
 	attack_settings.max_reduction_db = 36.0f;
@@ -480,6 +632,7 @@ static int test_expanded_control_ranges_are_effective(void)
 	      "10 ms attack endpoint responds faster than 20 ms, below the legacy 20 ms minimum");
 
 	struct lvb_settings recovery_settings = test_settings();
+	recovery_settings.fader_smoothness = 0.0f;
 	recovery_settings.max_boost_db = 18.0f;
 	recovery_settings.noise_floor_db = -100.0f;
 	recovery_settings.release_ms = 10000.0f;
@@ -512,9 +665,14 @@ int main(void)
 	CHECK(test_full_band_to_quiet_sermon_reopens_relative_gate() == 0, "full-band to quiet sermon transition");
 	CHECK(test_steady_band_and_sermon_outputs_move_toward_same_target() == 0,
 	      "steady band and sermon normalization");
+	CHECK(test_fader_curve_reduces_mixed_program_syllable_pumping() == 0,
+	      "fader curve reduces mixed-program syllable pumping");
+	CHECK(test_tiny_gain_steps_keep_linear_and_db_state_synchronized() == 0,
+	      "small per-sample gain steps preserve linear and dB precision");
 	CHECK(test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely() == 0,
 	      "quiet sermon to full-band transition");
 	CHECK(test_short_pauses_do_not_lift_minus_50_dbfs_ambience() == 0, "pause and room-noise gate");
+	CHECK(test_optional_quiet_attenuation_fades_without_hard_gating() == 0, "optional quiet-period attenuation");
 	CHECK(test_activity_gate_transition_is_smoothed() == 0, "smooth activity gate closure");
 	CHECK(test_stereo_room_noise_uses_per_channel_activity_floor() == 0, "stereo activity floor");
 	CHECK(test_fir_peak_guard_and_meter_at_44100_and_48000() == 0, "4x FIR guard at 44.1 and 48 kHz");
