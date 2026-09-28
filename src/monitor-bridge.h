@@ -20,8 +20,6 @@ struct lvb_monitor_snapshot {
 	uint32_t source_instance_id;
 	bool source_available;
 	bool stats_available;
-	bool calibration_waiting;
-	bool calibration_action_pending;
 };
 
 struct lvb_monitor_source {
@@ -32,9 +30,6 @@ struct lvb_monitor_source {
 void lvb_monitor_read(struct lvb_monitor_snapshot *snapshot);
 size_t lvb_monitor_list_sources(struct lvb_monitor_source *sources, size_t capacity);
 void lvb_monitor_select_source(uint32_t instance_id);
-void lvb_monitor_start_calibration(void);
-void lvb_monitor_apply_calibration(void);
-void lvb_monitor_reset_calibration(void);
 
 void lvb_monitor_dock_load(void);
 void lvb_monitor_dock_unload(void);

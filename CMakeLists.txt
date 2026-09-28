@@ -38,10 +38,7 @@ if(ENABLE_QT)
 endif()
 
 if(NOT ENABLE_FRONTEND_API OR NOT ENABLE_QT)
-  message(
-    FATAL_ERROR
-    "Live Volume Balancer requires ENABLE_FRONTEND_API and ENABLE_QT for live metering and calibration."
-  )
+  message(FATAL_ERROR "Live Volume Balancer requires ENABLE_FRONTEND_API and ENABLE_QT for its live monitor dock.")
 endif()
 
 find_package(Threads REQUIRED)

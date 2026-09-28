@@ -12,7 +12,8 @@
 #define LVB_PI 3.14159265358979323846
 #define LVB_LUFS_OFFSET (-0.691)
 #define LVB_BUCKET_SECONDS 0.01
-#define LVB_CALIBRATION_SECONDS 10.0
+#define LVB_ACTIVITY_HOLD_SECONDS 0.25f
+#define LVB_ACTIVITY_RELATIVE_DB 12.0f
 
 /*
  * ITU-R BS.1770-5 Annex 2, order-48 four-phase interpolating FIR.
@@ -27,16 +28,6 @@ static const float true_peak_coefficients[4][LVB_TRUE_PEAK_TAPS] = {
 	 0.77978515625f, -0.2003173828125f, 0.1015625f, -0.0582275390625f, 0.0330810546875f, -0.0189208984375f},
 	{0.001708984375f, 0.010986328125f, -0.0196533203125f, 0.033203125f, -0.0594482421875f, 0.1373291015625f,
 	 0.97216796875f, -0.102294921875f, 0.047607421875f, -0.026611328125f, 0.014892578125f, -0.00830078125f},
-};
-
-struct lvb_profile {
-	float target_lufs;
-	float max_boost_db;
-	float max_reduction_db;
-	float attack_ms;
-	float release_ms;
-	float ratio;
-	bool vad_gate_boost;
 };
 
 static float clampf(float value, float minimum, float maximum)
@@ -67,6 +58,13 @@ static float energy_to_lufs(double energy)
 	return (float)(LVB_LUFS_OFFSET + 10.0 * log10(energy));
 }
 
+static float energy_to_dbfs(double energy)
+{
+	if (!isfinite(energy) || energy <= 1e-12)
+		return -120.0f;
+	return (float)(10.0 * log10(energy));
+}
+
 static void configure_k_weighting(struct lvb_state *state, float sample_rate)
 {
 	const double frequency = sample_rate > 0.0f ? sample_rate : 48000.0;
@@ -91,17 +89,15 @@ static void configure_k_weighting(struct lvb_state *state, float sample_rate)
 	state->highpass_b[2] = 1.0 / highpass_a0;
 	state->highpass_a[0] = 2.0 * (highpass_k2 - 1.0) / highpass_a0;
 	state->highpass_a[1] = (1.0 - highpass_k / highpass_q + highpass_k2) / highpass_a0;
-
-	memset(state->k_shelf, 0, sizeof(state->k_shelf));
-	memset(state->k_highpass, 0, sizeof(state->k_highpass));
-	memset(state->calibration_k_shelf, 0, sizeof(state->calibration_k_shelf));
-	memset(state->calibration_k_highpass, 0, sizeof(state->calibration_k_highpass));
-	memset(state->voice_highpass, 0, sizeof(state->voice_highpass));
-	memset(state->voice_lowpass, 0, sizeof(state->voice_lowpass));
-	state->voice_envelope_coefficient = (float)(1.0 - exp(-1.0 / (0.08 * frequency)));
-	state->voice_highpass_alpha = exp(-2.0 * LVB_PI * 120.0 / frequency);
-	state->voice_lowpass_alpha = exp(-2.0 * LVB_PI * 3800.0 / frequency);
+	memset(state->input_k_shelf, 0, sizeof(state->input_k_shelf));
+	memset(state->input_k_highpass, 0, sizeof(state->input_k_highpass));
+	memset(state->output_k_shelf, 0, sizeof(state->output_k_shelf));
+	memset(state->output_k_highpass, 0, sizeof(state->output_k_highpass));
+	memset(&state->input_meter, 0, sizeof(state->input_meter));
+	memset(&state->output_meter, 0, sizeof(state->output_meter));
 	state->sample_rate = sample_rate;
+	state->activity_energy_coefficient = (float)(1.0 - exp(-1.0 / (0.005 * frequency)));
+	state->activity_gain_coefficient = (float)exp(-1.0 / (0.025 * frequency));
 	state->bucket_frames = (uint32_t)fmax(1.0, floor(frequency * LVB_BUCKET_SECONDS + 0.5));
 }
 
@@ -123,53 +119,88 @@ static double channel_weight(size_t channel, size_t channels)
 	return 1.0;
 }
 
-static void push_meter_bucket(struct lvb_state *state, double energy)
+static void meter_add_frame(struct lvb_meter_state *meter, double energy, uint32_t bucket_frames)
 {
-	if (state->meter_count == LVB_METER_BUCKETS)
-		state->short_term_sum -= state->meter_energy[state->meter_index];
-	else
-		state->meter_count++;
-	state->meter_energy[state->meter_index] = energy;
-	state->short_term_sum += energy;
-	state->meter_index = (state->meter_index + 1U) % LVB_METER_BUCKETS;
+	meter->current_bucket_sum += energy;
+	meter->frames_in_bucket++;
+	if (meter->frames_in_bucket < bucket_frames)
+		return;
 
-	if (state->momentary_count == 40U)
-		state->momentary_sum -= state->momentary_energy[state->momentary_index];
+	const double bucket_energy = meter->current_bucket_sum / (double)meter->frames_in_bucket;
+	if (meter->count == LVB_METER_BUCKETS)
+		meter->short_term_sum -= meter->energy[meter->index];
 	else
-		state->momentary_count++;
-	state->momentary_energy[state->momentary_index] = energy;
-	state->momentary_sum += energy;
-	state->momentary_index = (state->momentary_index + 1U) % 40U;
+		meter->count++;
+	meter->energy[meter->index] = bucket_energy;
+	meter->short_term_sum += bucket_energy;
+	meter->index = (meter->index + 1U) % LVB_METER_BUCKETS;
+
+	if (meter->momentary_count == LVB_MOMENTARY_BUCKETS)
+		meter->momentary_sum -= meter->momentary_energy[meter->momentary_index];
+	else
+		meter->momentary_count++;
+	meter->momentary_energy[meter->momentary_index] = bucket_energy;
+	meter->momentary_sum += bucket_energy;
+	meter->momentary_index = (meter->momentary_index + 1U) % LVB_MOMENTARY_BUCKETS;
+	meter->current_bucket_sum = 0.0;
+	meter->frames_in_bucket = 0;
 }
 
-static struct lvb_profile profile_for(const struct lvb_settings *settings, enum lvb_mode mode)
+static float meter_momentary_lufs(const struct lvb_meter_state *meter)
 {
-	struct lvb_profile profile;
-	switch (mode) {
-	case LVB_MODE_WORSHIP:
-		profile = (struct lvb_profile){-20.0f, 4.0f, 6.0f, 180.0f, 1800.0f, 1.5f, false};
-		break;
-	case LVB_MODE_WORSHIP_ACOUSTIC:
-		profile = (struct lvb_profile){-18.0f, 10.0f, 6.0f, 160.0f, 1400.0f, 1.7f, false};
-		break;
-	case LVB_MODE_SERMON:
-		profile = (struct lvb_profile){-18.0f, 10.0f, 12.0f, 90.0f, 1200.0f, 3.0f, false};
-		break;
-	case LVB_MODE_AUTO_ASSIST:
-		profile = (struct lvb_profile){-19.0f, 6.0f, 8.0f, 140.0f, 1600.0f, 2.0f, true};
-		break;
-	case LVB_MODE_CUSTOM:
-	default:
-		profile = (struct lvb_profile){clampf(settings->target_lufs, -30.0f, -9.0f),
-					       clampf(settings->max_boost_db, 0.0f, 18.0f),
-					       clampf(settings->max_reduction_db, 0.0f, 24.0f),
-					       clampf(settings->attack_ms, 20.0f, 1000.0f),
-					       clampf(settings->release_ms, 100.0f, 5000.0f),
-					       2.0f,
-					       false};
-		break;
+	const double average = meter->momentary_count ? meter->momentary_sum / meter->momentary_count : 0.0;
+	return energy_to_lufs(average);
+}
+
+static float meter_short_term_lufs(const struct lvb_meter_state *meter)
+{
+	const double average = meter->count ? meter->short_term_sum / meter->count : 0.0;
+	return energy_to_lufs(average);
+}
+
+static float update_activity(struct lvb_state *state, float level_dbfs, float floor_db, float elapsed_seconds)
+{
+	const float minimum_open_level = floor_db + 2.0f;
+	float open_threshold = minimum_open_level;
+	if (state->activity_reference_valid)
+		open_threshold = fmaxf(open_threshold, state->activity_reference_dbfs - LVB_ACTIVITY_RELATIVE_DB);
+	const float close_threshold = fmaxf(floor_db, open_threshold - 3.0f);
+	const bool absolute_silence = level_dbfs <= floor_db;
+	const bool candidate = !absolute_silence && level_dbfs >= open_threshold;
+
+	/*
+	 * Let the relative reference move down quickly when a band gives way to
+	 * quieter speech. Only levels above the absolute floor can move it, so room
+	 * noise during a pause cannot keep the activity gate open.
+	 */
+	if (level_dbfs > floor_db + 1.0f) {
+		if (!state->activity_reference_valid) {
+			state->activity_reference_dbfs = level_dbfs;
+			state->activity_reference_valid = true;
+		} else {
+			const float time_constant = level_dbfs > state->activity_reference_dbfs ? 0.20f : 0.45f;
+			const float coefficient = 1.0f - expf(-elapsed_seconds / time_constant);
+			state->activity_reference_dbfs += coefficient * (level_dbfs - state->activity_reference_dbfs);
+		}
 	}
-	return profile;
+
+	if (absolute_silence) {
+		state->activity_open = false;
+		state->activity_hold_seconds = 0.0f;
+	} else if (candidate) {
+		state->activity_open = true;
+		state->activity_hold_seconds = LVB_ACTIVITY_HOLD_SECONDS;
+	} else if (state->activity_open && level_dbfs >= close_threshold) {
+		state->activity_hold_seconds = LVB_ACTIVITY_HOLD_SECONDS;
+	} else if (state->activity_hold_seconds > elapsed_seconds) {
+		state->activity_hold_seconds -= elapsed_seconds;
+	} else {
+		state->activity_hold_seconds = 0.0f;
+		state->activity_open = false;
+	}
+
+	/* Hysteresis keeps status stable; below the open threshold, do not ride up. */
+	return (candidate || (state->activity_open && level_dbfs >= close_threshold)) ? 1.0f : 0.0f;
 }
 
 static float soft_knee_reduction(float above_target_db, float ratio, float knee_db)
@@ -206,68 +237,22 @@ static float true_peak_fir_values(float history[LVB_MAX_CHANNELS][LVB_TRUE_PEAK_
 	return maximum;
 }
 
-static void update_voice_detection(struct lvb_state *state, double band_energy, double mix_energy, float sample_rate)
-{
-	state->voice_envelope += state->voice_envelope_coefficient * ((float)band_energy - state->voice_envelope);
-	const bool candidate = state->voice_envelope > 3.2e-5f && mix_energy > 1e-7 && band_energy / mix_energy > 0.18;
-	if (candidate) {
-		state->voice_active = true;
-		state->voice_hold_seconds = 0.30f;
-	} else if (state->voice_hold_seconds > 0.0f) {
-		state->voice_hold_seconds = fmaxf(0.0f, state->voice_hold_seconds - 1.0f / sample_rate);
-	} else {
-		state->voice_active = false;
-	}
-	state->stats.voice_active = state->voice_active;
-	state->stats.voice_activity = candidate ? 1.0f : (state->voice_active ? 0.5f : 0.0f);
-}
-
 void lvb_state_init(struct lvb_state *state)
 {
 	if (!state)
 		return;
 	memset(state, 0, sizeof(*state));
 	state->gain = 1.0f;
-	state->sample_rate = 0.0f;
-	state->stats.momentary_lufs = -120.0f;
-	state->stats.short_term_lufs = -120.0f;
+	state->peak_guard_gain = 1.0f;
+	state->activity_gain = 1.0f;
+	state->activity_reference_dbfs = -120.0f;
+	state->stats.input_momentary_lufs = -120.0f;
+	state->stats.input_short_term_lufs = -120.0f;
+	state->stats.output_momentary_lufs = -120.0f;
+	state->stats.output_short_term_lufs = -120.0f;
 	state->stats.true_peak_dbtp = -120.0f;
-	state->stats.calibration_measured_lufs = -120.0f;
-	state->stats.mode = LVB_MODE_WORSHIP;
-	state->stats.calibration_mode = LVB_MODE_WORSHIP;
-}
-
-void lvb_calibration_start(struct lvb_state *state, const struct lvb_settings *settings)
-{
-	if (!state || !settings)
-		return;
-	const enum lvb_mode mode =
-		settings->mode >= LVB_MODE_CUSTOM && settings->mode < LVB_MODE_COUNT ? settings->mode : LVB_MODE_CUSTOM;
-	const struct lvb_profile profile = profile_for(settings, mode);
-	state->calibration_mode = (uint32_t)mode;
-	state->calibration_target_lufs = clampf(profile.target_lufs, -36.0f, -6.0f);
-	state->calibration_base_trim_db = clampf(settings->mode_trim_db[mode], -12.0f, 12.0f);
-	state->calibration_elapsed = 0.0;
-	state->calibration_energy_sum = 0.0;
-	state->calibration_sample_count = 0;
-	state->calibration_frame_count = 0;
-	memset(state->calibration_k_shelf, 0, sizeof(state->calibration_k_shelf));
-	memset(state->calibration_k_highpass, 0, sizeof(state->calibration_k_highpass));
-	state->calibration_active = true;
-	state->calibration_ready = false;
-	state->calibration_suggestion_db = 0.0f;
-	state->calibration_measured_lufs = -120.0f;
-}
-
-void lvb_calibration_reset(struct lvb_state *state)
-{
-	if (!state)
-		return;
-	state->calibration_active = false;
-	state->calibration_ready = false;
-	state->calibration_elapsed = 0.0;
-	state->calibration_suggestion_db = 0.0f;
-	state->calibration_measured_lufs = -120.0f;
+	state->stats.peak_hold_dbtp = -120.0f;
+	state->peak_hold_dbtp = -120.0f;
 }
 
 void lvb_get_stats(const struct lvb_state *state, struct lvb_stats *stats)
@@ -287,86 +272,68 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	if (fabsf(state->sample_rate - sample_rate) > 0.5f)
 		configure_k_weighting(state, sample_rate);
 
-	const enum lvb_mode mode =
-		settings->mode >= LVB_MODE_CUSTOM && settings->mode < LVB_MODE_COUNT ? settings->mode : LVB_MODE_CUSTOM;
-	const struct lvb_profile profile = profile_for(settings, mode);
-	const float mode_trim = clampf(settings->mode_trim_db[mode], -12.0f, 12.0f);
-	const float target_lufs = clampf(profile.target_lufs, -36.0f, -6.0f);
-	const float noise_floor_db = clampf(settings->noise_floor_db, -100.0f, 0.0f);
+	const float target_lufs = clampf(settings->target_lufs, -30.0f, -9.0f);
+	const float max_boost_db = clampf(settings->max_boost_db, 0.0f, 18.0f);
+	const float max_reduction_db = clampf(settings->max_reduction_db, 0.0f, 24.0f);
+	const float attack_ms = clampf(settings->attack_ms, 20.0f, 1000.0f);
+	const float release_ms = clampf(settings->release_ms, 100.0f, 5000.0f);
+	const float noise_floor_db = clampf(settings->noise_floor_db, -80.0f, -24.0f);
 	const float peak_ceiling_db = clampf(settings->peak_ceiling_db, -12.0f, 0.0f);
 	const float peak_ceiling = db_to_linear(peak_ceiling_db);
 
+	/* Sense the current block without modifying it. */
 	for (size_t frame = 0; frame < frames; frame++) {
 		double frame_energy = 0.0;
-		double frame_voice_energy = 0.0;
+		double frame_activity_energy = 0.0;
+		size_t activity_channels = 0;
 		for (size_t channel = 0; channel < channels; channel++) {
-			const float *samples = audio[channel];
-			if (!samples)
+			if (!audio[channel])
 				continue;
 			const double weight = channel_weight(channel, channels);
-			const double input = isfinite(samples[frame]) ? samples[frame] : 0.0;
+			const double input = isfinite(audio[channel][frame]) ? audio[channel][frame] : 0.0;
 			const double shelf =
-				process_biquad(input, state->shelf_b, state->shelf_a, &state->k_shelf[channel]);
+				process_biquad(input, state->shelf_b, state->shelf_a, &state->input_k_shelf[channel]);
 			const double filtered = process_biquad(shelf, state->highpass_b, state->highpass_a,
-							       &state->k_highpass[channel]);
+							       &state->input_k_highpass[channel]);
 			frame_energy += weight * filtered * filtered;
-
-			const double hp = input - state->voice_highpass[channel].x1 +
-					  state->voice_highpass_alpha * state->voice_highpass[channel].y1;
-			state->voice_highpass[channel].x1 = input;
-			state->voice_highpass[channel].y1 = hp;
-			const double band = (1.0 - state->voice_lowpass_alpha) * hp +
-					    state->voice_lowpass_alpha * state->voice_lowpass[channel].y1;
-			state->voice_lowpass[channel].y1 = band;
-			frame_voice_energy += weight * band * band;
+			if (weight > 0.0) {
+				frame_activity_energy += input * input;
+				activity_channels++;
+			}
 		}
-		state->current_bucket_sum += frame_energy;
-		state->frames_in_bucket++;
-		if (state->frames_in_bucket >= state->bucket_frames) {
-			const double bucket_energy = state->current_bucket_sum / (double)state->frames_in_bucket;
-			push_meter_bucket(state, bucket_energy);
-			state->current_bucket_sum = 0.0;
-			state->frames_in_bucket = 0;
-		}
-		update_voice_detection(state, frame_voice_energy, frame_energy, sample_rate);
+		if (activity_channels > 0)
+			frame_activity_energy /= (double)activity_channels;
+		state->activity_energy +=
+			state->activity_energy_coefficient * (frame_activity_energy - state->activity_energy);
+		meter_add_frame(&state->input_meter, frame_energy, state->bucket_frames);
 	}
 
-	const double momentary_average = state->momentary_count ? state->momentary_sum / state->momentary_count : 0.0;
-	const double short_average = state->meter_count ? state->short_term_sum / state->meter_count : 0.0;
-	const float momentary_lufs = energy_to_lufs(momentary_average);
-	const float short_term_lufs = energy_to_lufs(short_average);
-	const float reported_level = momentary_lufs;
-	const bool below_floor = reported_level < noise_floor_db;
-	const bool voice_gate_blocked = profile.vad_gate_boost && !state->voice_active;
+	const float input_momentary_lufs = meter_momentary_lufs(&state->input_meter);
+	const float input_short_term_lufs = meter_short_term_lufs(&state->input_meter);
+	const float block_seconds = (float)((double)frames / sample_rate);
+	const float fast_activity_dbfs = energy_to_dbfs(state->activity_energy);
+	const float activity_allows_gain = update_activity(state, fast_activity_dbfs, noise_floor_db, block_seconds);
 	float requested_gain_db = 0.0f;
-	if (!below_floor) {
-		const float difference_db = target_lufs - reported_level;
-		if (difference_db >= 0.0f) {
-			if (!voice_gate_blocked)
-				requested_gain_db = fminf(difference_db, profile.max_boost_db);
-		} else {
-			requested_gain_db = -soft_knee_reduction(-difference_db, profile.ratio, 6.0f);
-		}
+	if (activity_allows_gain > 0.5f) {
+		const float difference_db = target_lufs - input_momentary_lufs;
+		if (difference_db >= 0.0f)
+			requested_gain_db = fminf(difference_db, max_boost_db);
+		else
+			requested_gain_db = -soft_knee_reduction(-difference_db, 10.0f, 1.5f);
 	}
-	requested_gain_db = clampf(requested_gain_db, -profile.max_reduction_db, profile.max_boost_db);
-	const float loudness_target_gain = db_to_linear(requested_gain_db + mode_trim);
-	const float attack_ms = clampf(profile.attack_ms, 5.0f, 2000.0f);
-	const float release_ms = clampf(profile.release_ms, 50.0f, 5000.0f);
+	requested_gain_db = clampf(requested_gain_db, -max_reduction_db, max_boost_db);
+	const float loudness_target_gain = db_to_linear(requested_gain_db);
 	const float time_ms = loudness_target_gain < state->gain ? attack_ms : release_ms;
 	const float smoothing = expf(-1.0f / (0.001f * time_ms * sample_rate));
+	const float guard_release = expf(-1.0f / (0.075f * sample_rate));
 
-	state->stats.momentary_lufs = momentary_lufs;
-	state->stats.short_term_lufs = short_term_lufs;
-	state->stats.true_peak_dbtp = -120.0f;
-	state->stats.mode = mode;
 	float maximum_output_peak = 0.0f;
 	float last_applied_gain = 1.0f;
-	const float guard_release = expf(-1.0f / (0.075f * sample_rate));
 	for (size_t frame = 0; frame < frames; frame++) {
 		float input_values[LVB_MAX_CHANNELS] = {0};
 		for (size_t channel = 0; channel < channels; channel++) {
 			if (audio[channel])
-				input_values[channel] = audio[channel][frame];
+				input_values[channel] = isfinite(audio[channel][frame]) ? audio[channel][frame] : 0.0f;
 		}
 		const float estimated_peak = true_peak_fir_values(
 			state->true_peak_history, &state->true_peak_history_index, input_values, channels);
@@ -374,6 +341,7 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 		if (settings->bypass) {
 			state->gain = 1.0f;
 			state->peak_guard_gain = 1.0f;
+			state->activity_gain = 1.0f;
 		} else {
 			state->gain = loudness_target_gain + smoothing * (state->gain - loudness_target_gain);
 			float desired_guard_gain = 1.0f;
@@ -386,13 +354,16 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 							 guard_release * (state->peak_guard_gain - desired_guard_gain);
 		}
 
-		float applied_gain = settings->bypass ? 1.0f : state->gain * state->peak_guard_gain;
-		/* Never let stored boost carry into silence/noise or a VAD-gated segment. */
-		if (!settings->bypass && (below_floor || voice_gate_blocked) && applied_gain > 1.0f)
-			applied_gain = 1.0f;
+		const float desired_activity_gain =
+			!settings->bypass && activity_allows_gain < 0.5f && state->gain > 1.0f ? 1.0f / state->gain
+											       : 1.0f;
+		state->activity_gain = desired_activity_gain + state->activity_gain_coefficient *
+								       (state->activity_gain - desired_activity_gain);
+		float applied_gain = settings->bypass ? 1.0f
+						      : state->gain * state->activity_gain * state->peak_guard_gain;
 		last_applied_gain = applied_gain;
 		float output_values[LVB_MAX_CHANNELS] = {0};
-		double calibration_frame_energy = 0.0;
+		double frame_output_energy = 0.0;
 		for (size_t channel = 0; channel < channels; channel++) {
 			float *samples = audio[channel];
 			const float input = input_values[channel];
@@ -401,31 +372,20 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 			if (!samples)
 				continue;
 			float output = state->true_peak_delay_frames >= LVB_TRUE_PEAK_LATENCY ? delayed : 0.0f;
-			if (isfinite(output)) {
-				output *= applied_gain;
-				if (!settings->bypass)
-					output = clampf(output, -peak_ceiling, peak_ceiling);
-			}
+			output *= applied_gain;
+			if (!settings->bypass)
+				output = clampf(output, -peak_ceiling, peak_ceiling);
 			samples[frame] = output;
 			output_values[channel] = output;
-			if (state->calibration_active) {
-				const double clean_output = isfinite(output) ? output : 0.0;
-				const double calibrated_shelf = process_biquad(clean_output, state->shelf_b,
-									       state->shelf_a,
-									       &state->calibration_k_shelf[channel]);
-				const double calibrated_filtered =
-					process_biquad(calibrated_shelf, state->highpass_b, state->highpass_a,
-						       &state->calibration_k_highpass[channel]);
-				calibration_frame_energy +=
-					channel_weight(channel, channels) * calibrated_filtered * calibrated_filtered;
-			}
+
+			const double weight = channel_weight(channel, channels);
+			const double shelf =
+				process_biquad(output, state->shelf_b, state->shelf_a, &state->output_k_shelf[channel]);
+			const double filtered = process_biquad(shelf, state->highpass_b, state->highpass_a,
+							       &state->output_k_highpass[channel]);
+			frame_output_energy += weight * filtered * filtered;
 		}
-		if (state->calibration_active) {
-			state->calibration_energy_sum += calibration_frame_energy;
-			state->calibration_sample_count++;
-			state->calibration_frame_count++;
-			state->calibration_elapsed += 1.0 / (double)sample_rate;
-		}
+		meter_add_frame(&state->output_meter, frame_output_energy, state->bucket_frames);
 		if (state->true_peak_delay_frames < LVB_TRUE_PEAK_LATENCY)
 			state->true_peak_delay_frames++;
 		state->true_peak_delay_index = (state->true_peak_delay_index + 1U) % LVB_TRUE_PEAK_LATENCY;
@@ -435,29 +395,24 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 			maximum_output_peak = output_peak;
 	}
 
-	state->stats.gain_reduction_db = settings->bypass ? 0.0f : fmaxf(0.0f, -linear_to_db(last_applied_gain));
-	state->stats.gain_db = settings->bypass ? 0.0f : linear_to_db(last_applied_gain);
+	state->stats.input_momentary_lufs = input_momentary_lufs;
+	state->stats.input_short_term_lufs = input_short_term_lufs;
+	state->stats.output_momentary_lufs = meter_momentary_lufs(&state->output_meter);
+	state->stats.output_short_term_lufs = meter_short_term_lufs(&state->output_meter);
 	state->stats.true_peak_dbtp = linear_to_db(maximum_output_peak);
-	state->meter_true_peak = maximum_output_peak;
-	if (state->calibration_active && state->calibration_elapsed >= LVB_CALIBRATION_SECONDS) {
-		state->calibration_measured_lufs = energy_to_lufs(
-			state->calibration_energy_sum /
-			(double)(state->calibration_sample_count ? state->calibration_sample_count : 1U));
-		const float requested_correction =
-			clampf(state->calibration_target_lufs - state->calibration_measured_lufs, -12.0f, 12.0f);
-		const float corrected_trim =
-			clampf(state->calibration_base_trim_db + requested_correction, -12.0f, 12.0f);
-		state->calibration_suggestion_db = corrected_trim - state->calibration_base_trim_db;
-		state->calibration_active = false;
-		state->calibration_ready = state->calibration_measured_lufs > -90.0f;
+	state->stats.target_lufs = target_lufs;
+	state->stats.peak_ceiling_dbtp = peak_ceiling_db;
+	if (state->stats.true_peak_dbtp >= state->peak_hold_dbtp) {
+		state->peak_hold_dbtp = state->stats.true_peak_dbtp;
+		state->peak_hold_seconds = 1.5f;
+	} else if (state->peak_hold_seconds > block_seconds) {
+		state->peak_hold_seconds -= block_seconds;
+	} else {
+		state->peak_hold_seconds = 0.0f;
+		state->peak_hold_dbtp =
+			fmaxf(state->stats.true_peak_dbtp, state->peak_hold_dbtp - 12.0f * block_seconds);
 	}
-	state->stats.calibration_active = state->calibration_active;
-	state->stats.calibration_ready = state->calibration_ready;
-	state->stats.calibration_progress =
-		state->calibration_active
-			? clampf((float)(state->calibration_elapsed / LVB_CALIBRATION_SECONDS), 0.0f, 1.0f)
-			: (state->calibration_ready ? 1.0f : 0.0f);
-	state->stats.calibration_measured_lufs = state->calibration_measured_lufs;
-	state->stats.calibration_suggestion_db = state->calibration_suggestion_db;
-	state->stats.calibration_mode = (enum lvb_mode)state->calibration_mode;
+	state->stats.peak_hold_dbtp = state->peak_hold_dbtp;
+	state->stats.gain_db = settings->bypass ? 0.0f : linear_to_db(last_applied_gain);
+	state->stats.activity_open = state->activity_open;
 }
