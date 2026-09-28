@@ -11,6 +11,8 @@
 #include <stdint.h>
 
 #define LVB_MAX_CHANNELS 8
+#define LVB_TARGET_LUFS_MIN (-36.0f)
+#define LVB_TARGET_LUFS_MAX 0.0f
 #define LVB_METER_BUCKETS 300
 #define LVB_MOMENTARY_BUCKETS 40
 #define LVB_TRUE_PEAK_TAPS 12

@@ -408,7 +408,7 @@ static int test_fast_meter_ballistics_and_reported_sample_rate(void)
 static int test_expanded_control_ranges_are_effective(void)
 {
 	struct lvb_settings settings = test_settings();
-	settings.target_lufs = -6.0f;
+	settings.target_lufs = LVB_TARGET_LUFS_MAX;
 	settings.max_boost_db = 36.0f;
 	settings.max_reduction_db = 36.0f;
 	settings.release_ms = 50.0f;
@@ -417,16 +417,30 @@ static int test_expanded_control_ranges_are_effective(void)
 	struct lvb_state quiet_state;
 	lvb_state_init(&quiet_state);
 	process_segment(&quiet_state, &settings, 48000.0f, 900.0f, 0.015f, 48000U * 6U, 0, NULL);
-	CHECK(quiet_state.stats.target_lufs == -6.0f, "target slider lower bound is accepted by DSP");
+	CHECK(quiet_state.stats.target_lufs == LVB_TARGET_LUFS_MAX,
+	      "0 LUFS target slider upper endpoint is accepted by DSP");
 	CHECK(quiet_state.stats.gain_db > 20.0f, "36 dB upward-compensation range is not truncated by legacy limits");
 
-	settings.target_lufs = -36.0f;
+	settings.target_lufs = LVB_TARGET_LUFS_MAX + 6.0f;
+	settings.peak_ceiling_db = -1.0f;
+	struct lvb_state peak_limited_state;
+	lvb_state_init(&peak_limited_state);
+	float peak_limited_dbtp = -120.0f;
+	process_segment(&peak_limited_state, &settings, 48000.0f, 900.0f, 0.015f, 48000U * 6U, 48000U * 5U,
+			&peak_limited_dbtp);
+	CHECK(peak_limited_state.stats.target_lufs == LVB_TARGET_LUFS_MAX,
+	      "saved targets above 0 LUFS are clamped to the slider maximum");
+	CHECK(peak_limited_dbtp <= -0.8f && peak_limited_state.stats.output_short_term_lufs < -0.5f,
+	      "peak ceiling can keep the rolling output below a 0 LUFS target");
+
+	settings.target_lufs = LVB_TARGET_LUFS_MIN;
 	settings.max_boost_db = 0.0f;
 	settings.attack_ms = 10.0f;
 	struct lvb_state loud_state;
 	lvb_state_init(&loud_state);
 	process_segment(&loud_state, &settings, 48000.0f, 900.0f, 0.80f, 48000U * 4U, 0, NULL);
-	CHECK(loud_state.stats.target_lufs == -36.0f, "target slider upper range endpoint is accepted by DSP");
+	CHECK(loud_state.stats.target_lufs == LVB_TARGET_LUFS_MIN,
+	      "−36 LUFS target slider lower endpoint is accepted by DSP");
 	CHECK(loud_state.stats.gain_db < -25.0f, "36 dB downward-reduction range is not truncated by legacy limits");
 
 	settings.target_lufs = -18.0f;

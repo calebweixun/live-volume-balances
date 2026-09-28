@@ -368,7 +368,7 @@ static obs_properties_t *leveler_properties(void *data)
 	obs_properties_t *properties = obs_properties_create();
 	obs_property_t *property;
 	property = obs_properties_add_float_slider(properties, SETTING_TARGET_LUFS, obs_module_text("TargetLoudness"),
-						   -36.0, -6.0, 0.5);
+						   LVB_TARGET_LUFS_MIN, LVB_TARGET_LUFS_MAX, 0.5);
 	obs_property_float_set_suffix(property, " LUFS");
 	set_property_help(property, "TargetLoudnessHelp");
 	property = obs_properties_add_float_slider(properties, SETTING_CEILING, obs_module_text("PeakCeiling"), -24.0,

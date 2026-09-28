@@ -9,7 +9,7 @@ An OBS audio filter that automatically rides the level of a live mixed feed. Add
 3. Open **View → Docks → Live Volume Balancer** to watch input/output levels, rolling loudness, applied gain, and peak hold while audio is running. Each filter instance has its own card; use its gear button to open that filter's settings.
 4. If room noise rises in pauses, raise the activity floor (for example, from −46 to −42 dBFS). If quiet speech does not open the gate, lower it carefully.
 
-The filter does not identify speech versus singing and does not switch settings by scene. It treats the feed as one continuous program, so music and speech share the same target. The gain rider smooths changes to retain some internal dynamics; source levels may remain different when the maximum compensation or peak ceiling is reached.
+The filter does not identify speech versus singing and does not switch settings by scene. It treats the feed as one continuous program, so music and speech share the same target. The gain rider smooths changes to retain some internal dynamics; source levels may remain different when the maximum compensation or peak ceiling is reached. A high target such as 0 LUFS is still only a loudness goal: maximum upward compensation and the separate estimated peak ceiling may prevent output from reaching it.
 
 When an existing installation is upgraded from the service-mode version, its saved mode settings are migrated automatically the next time OBS loads the filter. The selected target, bypass, and peak ceiling are retained; old mode-specific compensation, timing, and noise-floor tuning are replaced with the new automatic defaults.
 
@@ -17,7 +17,7 @@ When an existing installation is upgraded from the service-mode version, its sav
 
 | Control | What it does |
 | --- | --- |
-| Target rolling loudness | Average level the rider moves toward. Range: −36 to −6 LUFS; default: −18 LUFS. |
+| Target rolling loudness | Average level the rider moves toward. Range: −36 to 0 LUFS; default: −18 LUFS. This is a goal, not an output ceiling; maximum upward compensation or the peak guard ceiling can keep output below it. |
 | 4x FIR peak guard ceiling | Separate output safety limit for estimated intersample peaks. Range: −24 to 0 dBTP est.; default: −1 dBTP. |
 | Bypass | Turns off gain riding and peak protection. The fixed six-sample delay remains. |
 | Advanced: maximum upward compensation | Range: 0 to 36 dB; default: 18 dB. |
@@ -92,7 +92,7 @@ clang -std=c11 -Wall -Wextra -Wpedantic -Werror -Isrc \
 3. 在「檢視 → 面板 → 即時音量平衡器」開啟監看面板，每組音訊會有獨立卡片；按卡片的齒輪可直接開啟該濾鏡設定。
 4. 若停頓時環境聲被抬高，可提高活動底線（例如從 −46 調到 −42 dBFS）；若小聲講道無法開門，則小心降低底線。
 
-濾鏡不會判斷語音或唱歌，也不會依場景切換設定。它將混音台總訊號視為一條連續節目，音樂與講道共用同一目標。增益變化經過平滑處理以保留部分音樂動態；若最大補償或峰值上限已達限制，輸入差異可能無法完全消除。
+濾鏡不會判斷語音或唱歌，也不會依場景切換設定。它將混音台總訊號視為一條連續節目，音樂與講道共用同一目標。增益變化經過平滑處理以保留部分音樂動態；若最大補償或峰值上限已達限制，輸入差異可能無法完全消除。即使設定 0 LUFS，這仍是響度目標而非輸出上限；最大向上補償與獨立的估算峰值上限可能使輸出無法達到目標。
 
 從舊版「聚會模式」升級時，OBS 下次載入濾鏡會自動遷移已儲存設定。保留原目標、旁通與峰值上限；舊版依模式設定的補償、反應速度與噪音底線會改用新的自動預設。
 
@@ -100,7 +100,7 @@ clang -std=c11 -Wall -Wextra -Wpedantic -Werror -Isrc \
 
 | 控制項 | 用途 |
 | --- | --- |
-| 滾動目標響度 | 自動增益追近的平均電平，範圍 −36 至 −6 LUFS，預設 −18 LUFS。 |
+| 滾動目標響度 | 自動增益追近的平均電平，範圍 −36 至 0 LUFS，預設 −18 LUFS。這是響度目標，不是輸出上限；最大向上補償或峰值保護上限可能使輸出低於目標。 |
 | 4 倍 FIR 峰值保護上限 | 獨立的輸出安全上限，限制估算的取樣間峰值；範圍 −24 至 0 dBTP 估算值，預設 −1 dBTP。 |
 | 旁通 | 關閉自動增益與峰值保護，但固定 6 個取樣的延遲仍保留。 |
 | 進階：最大向上補償 | 限制安靜且有活動的內容最多能提高多少；範圍 0 至 36 dB，預設 18 dB。 |
