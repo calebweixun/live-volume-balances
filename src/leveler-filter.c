@@ -42,6 +42,7 @@ static pthread_mutex_t instances_lock = PTHREAD_MUTEX_INITIALIZER;
 #define SETTING_NOISE_FLOOR "noise_floor_db"
 #define SETTING_FADER_SMOOTHNESS "fader_smoothness"
 #define SETTING_ACTIVITY_REENTRY_SPEED "activity_reentry_speed"
+#define SETTING_LOUDNESS_JUMP_RESPONSE "loudness_jump_response"
 #define SETTING_QUIET_ATTENUATION "quiet_attenuation_db"
 #define SETTING_CEILING "peak_ceiling_db"
 #define SETTING_SCHEMA_VERSION "settings_schema_version"
@@ -57,6 +58,7 @@ struct leveler_filter_data {
 	lvb_atomic_uint32_t noise_floor_db;
 	lvb_atomic_uint32_t fader_smoothness;
 	lvb_atomic_uint32_t activity_reentry_speed;
+	lvb_atomic_uint32_t loudness_jump_response;
 	lvb_atomic_uint32_t quiet_attenuation_db;
 	lvb_atomic_uint32_t peak_ceiling_db;
 	obs_source_t *filter_source;
@@ -165,6 +167,7 @@ static struct lvb_settings leveler_settings_snapshot(const struct leveler_filter
 		.noise_floor_db = bits_float(lvb_atomic_load(&filter->noise_floor_db)),
 		.fader_smoothness = bits_float(lvb_atomic_load(&filter->fader_smoothness)),
 		.activity_reentry_speed = bits_float(lvb_atomic_load(&filter->activity_reentry_speed)),
+		.loudness_jump_response = bits_float(lvb_atomic_load(&filter->loudness_jump_response)),
 		.quiet_attenuation_db = bits_float(lvb_atomic_load(&filter->quiet_attenuation_db)),
 		.peak_ceiling_db = bits_float(lvb_atomic_load(&filter->peak_ceiling_db)),
 		.bypass = lvb_atomic_load(&filter->bypass) != 0,
@@ -244,6 +247,7 @@ static void leveler_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, SETTING_NOISE_FLOOR, -46.0);
 	obs_data_set_default_int(settings, SETTING_FADER_SMOOTHNESS, (int)LVB_FADER_SMOOTHNESS_DEFAULT);
 	obs_data_set_default_int(settings, SETTING_ACTIVITY_REENTRY_SPEED, (int)LVB_ACTIVITY_REENTRY_SPEED_DEFAULT);
+	obs_data_set_default_int(settings, SETTING_LOUDNESS_JUMP_RESPONSE, (int)LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT);
 	obs_data_set_default_double(settings, SETTING_QUIET_ATTENUATION, 0.0);
 	obs_data_set_default_double(settings, SETTING_CEILING, -1.0);
 }
@@ -288,6 +292,13 @@ static void migrate_legacy_settings(obs_data_t *settings)
 			obs_data_set_int(settings, SETTING_ACTIVITY_REENTRY_SPEED,
 					 (int)LVB_ACTIVITY_REENTRY_SPEED_DEFAULT);
 		obs_data_set_int(settings, SETTING_SCHEMA_VERSION, 5);
+		schema_version = 5;
+	}
+	if (schema_version < 6) {
+		if (!obs_data_has_user_value(settings, SETTING_LOUDNESS_JUMP_RESPONSE))
+			obs_data_set_int(settings, SETTING_LOUDNESS_JUMP_RESPONSE,
+					 (int)LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT);
+		obs_data_set_int(settings, SETTING_SCHEMA_VERSION, 6);
 	}
 }
 
@@ -314,6 +325,8 @@ static void leveler_update(void *opaque, obs_data_t *settings)
 			 float_bits((float)obs_data_get_int(settings, SETTING_FADER_SMOOTHNESS)));
 	lvb_atomic_store(&filter->activity_reentry_speed,
 			 float_bits((float)obs_data_get_int(settings, SETTING_ACTIVITY_REENTRY_SPEED)));
+	lvb_atomic_store(&filter->loudness_jump_response,
+			 float_bits((float)obs_data_get_int(settings, SETTING_LOUDNESS_JUMP_RESPONSE)));
 	lvb_atomic_store(&filter->quiet_attenuation_db,
 			 float_bits((float)obs_data_get_double(settings, SETTING_QUIET_ATTENUATION)));
 	lvb_atomic_store(&filter->peak_ceiling_db, float_bits((float)obs_data_get_double(settings, SETTING_CEILING)));
@@ -332,6 +345,7 @@ static void *leveler_create(obs_data_t *settings, obs_source_t *source)
 	lvb_atomic_init(&filter->noise_floor_db, float_bits(-46.0f));
 	lvb_atomic_init(&filter->fader_smoothness, float_bits(LVB_FADER_SMOOTHNESS_DEFAULT));
 	lvb_atomic_init(&filter->activity_reentry_speed, float_bits(LVB_ACTIVITY_REENTRY_SPEED_DEFAULT));
+	lvb_atomic_init(&filter->loudness_jump_response, float_bits(LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT));
 	lvb_atomic_init(&filter->quiet_attenuation_db, float_bits(0.0f));
 	lvb_atomic_init(&filter->peak_ceiling_db, float_bits(-1.0f));
 	filter->filter_source = source;
@@ -437,6 +451,12 @@ static obs_properties_t *leveler_properties(void *data)
 						 (int)LVB_ACTIVITY_REENTRY_SPEED_MAX, 1);
 	obs_property_int_set_suffix(property, " %");
 	set_property_help(property, "ActivityReentrySpeedHelp");
+	property = obs_properties_add_int_slider(advanced, SETTING_LOUDNESS_JUMP_RESPONSE,
+						 obs_module_text("LoudnessJumpResponse"),
+						 (int)LVB_LOUDNESS_JUMP_RESPONSE_MIN,
+						 (int)LVB_LOUDNESS_JUMP_RESPONSE_MAX, 1);
+	obs_property_int_set_suffix(property, " %");
+	set_property_help(property, "LoudnessJumpResponseHelp");
 	obs_properties_add_group(properties, "advanced", obs_module_text("Advanced"), OBS_GROUP_NORMAL, advanced);
 	return properties;
 }

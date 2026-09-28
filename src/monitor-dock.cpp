@@ -264,12 +264,13 @@ public:
 	}
 
 	const QString &setAdvancedSettingsTooltip(float fader_smoothness, float activity_reentry_speed,
-						  float quiet_attenuation_db)
+						  float loudness_jump_response, float quiet_attenuation_db)
 	{
 		const QString next_tooltip = localized("GainBarHelp") + QStringLiteral("\n") +
 					     localized("GainAdvancedSettingsTooltipFormat")
 						     .arg(fader_smoothness, 0, 'f', 0)
 						     .arg(activity_reentry_speed, 0, 'f', 0)
+						     .arg(loudness_jump_response, 0, 'f', 0)
 						     .arg(quiet_attenuation_db, 0, 'f', 1);
 		if (m_tooltip != next_tooltip) {
 			m_tooltip = next_tooltip;
@@ -536,8 +537,10 @@ public:
 		set_label_text(m_gain_value, gain_text);
 		m_gain_meter->setReading(stats.gain_db, stats.max_reduction_db, stats.max_boost_db);
 		m_gain_meter->setBypassed(stats.bypass);
-		const QString &gain_tooltip = m_gain_meter->setAdvancedSettingsTooltip(
-			stats.fader_smoothness, stats.activity_reentry_speed, stats.quiet_attenuation_db);
+		const QString &gain_tooltip = m_gain_meter->setAdvancedSettingsTooltip(stats.fader_smoothness,
+										       stats.activity_reentry_speed,
+										       stats.loudness_jump_response,
+										       stats.quiet_attenuation_db);
 		if (m_gain_value->toolTip() != gain_tooltip)
 			m_gain_value->setToolTip(gain_tooltip);
 		set_label_text(m_gain_minimum,

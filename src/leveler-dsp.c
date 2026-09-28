@@ -21,6 +21,16 @@
 #define LVB_ACTIVITY_REENTRY_CONFIRM_SECONDS 0.040f
 #define LVB_ACTIVITY_REENTRY_RAMP_SECONDS 2.0f
 #define LVB_PEAK_RIDER_HEADROOM_DB 0.5f
+#define LVB_LOUDNESS_JUMP_TRIGGER_LU 6.0f
+#define LVB_LOUDNESS_JUMP_CLEAR_LU 4.0f
+#define LVB_LOUDNESS_JUMP_CONFIRM_SECONDS 0.25f
+#define LVB_LOUDNESS_JUMP_FAST_RMS_MARGIN_DB 3.0f
+#define LVB_LOUDNESS_JUMP_FAST_RMS_REFERENCE_SECONDS 3.0f
+#define LVB_LOUDNESS_JUMP_FAST_RMS_GAP_SECONDS 0.08f
+#define LVB_LOUDNESS_JUMP_CLEAR_SECONDS 0.30f
+#define LVB_LOUDNESS_JUMP_COOLDOWN_SECONDS 1.0f
+#define LVB_LOUDNESS_JUMP_MAX_EXTRA_DOWN_RATE 28.0f
+#define LVB_LOUDNESS_JUMP_MAX_EXTRA_DOWN_ACCELERATION 360.0f
 #define LVB_NEPER_PER_DB 0.1151292546497022842
 
 /*
@@ -264,6 +274,8 @@ void lvb_state_init(struct lvb_state *state)
 	state->gain_rate_db_per_second = 0.0f;
 	state->peak_guard_gain = 1.0f;
 	state->activity_reference_dbfs = -120.0f;
+	state->loudness_jump_rms_reference_dbfs = -120.0f;
+	state->loudness_jump_armed = true;
 	state->stats.input_momentary_lufs = -120.0f;
 	state->stats.input_short_term_lufs = -120.0f;
 	state->stats.input_fast_rms_dbfs = -120.0f;
@@ -308,6 +320,9 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	const float activity_reentry_speed = clampf(settings->activity_reentry_speed, LVB_ACTIVITY_REENTRY_SPEED_MIN,
 						    LVB_ACTIVITY_REENTRY_SPEED_MAX);
 	const float activity_reentry_ratio = activity_reentry_speed / LVB_ACTIVITY_REENTRY_SPEED_MAX;
+	const float loudness_jump_response = clampf(settings->loudness_jump_response, LVB_LOUDNESS_JUMP_RESPONSE_MIN,
+						    LVB_LOUDNESS_JUMP_RESPONSE_MAX);
+	const float loudness_jump_response_ratio = loudness_jump_response / LVB_LOUDNESS_JUMP_RESPONSE_MAX;
 	const float quiet_attenuation_db =
 		clampf(settings->quiet_attenuation_db, LVB_QUIET_ATTENUATION_MIN, LVB_QUIET_ATTENUATION_MAX);
 	const float peak_ceiling_db = clampf(settings->peak_ceiling_db, -24.0f, 0.0f);
@@ -350,6 +365,17 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	const float block_seconds = (float)((double)frames / sample_rate);
 	const float fast_activity_dbfs = energy_to_dbfs(state->activity_energy);
 	const float activity_allows_gain = update_activity(state, fast_activity_dbfs, noise_floor_db, block_seconds);
+	if (state->activity_open && activity_allows_gain > 0.5f) {
+		if (!state->loudness_jump_rms_reference_valid) {
+			state->loudness_jump_rms_reference_dbfs = fast_activity_dbfs;
+			state->loudness_jump_rms_reference_valid = true;
+		} else {
+			const float reference_coefficient =
+				1.0f - expf(-block_seconds / LVB_LOUDNESS_JUMP_FAST_RMS_REFERENCE_SECONDS);
+			state->loudness_jump_rms_reference_dbfs +=
+				reference_coefficient * (fast_activity_dbfs - state->loudness_jump_rms_reference_dbfs);
+		}
+	}
 	if (activity_allows_gain > 0.5f) {
 		if (state->activity_reentry_armed && state->activity_reentry_seconds <= 0.0f)
 			state->activity_reentry_pending = true;
@@ -387,12 +413,85 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 		state->quiet_transition_seconds = 0.0f;
 	const bool recovery_assist_active = state->quiet_transition_seconds >= 0.80f;
 	const bool activity_reentry_active = state->activity_reentry_seconds > 0.0f && state->activity_open;
+	/*
+	 * A sustained rise in the 400 ms reading relative to the 3 s bed can indicate
+	 * a real program transition (for example, speech into singing or a band). A
+	 * confirmation timer, hysteresis and cooldown keep short syllables and accents
+	 * from repeatedly engaging the faster downward fader. This is level detection,
+	 * not voice/music classification.
+	 */
+	const float momentary_over_short_lu = input_momentary_lufs - input_short_term_lufs;
+	const bool fast_jump_evidence =
+		state->loudness_jump_rms_reference_valid && fast_activity_dbfs >= noise_floor_db + 12.0f &&
+		fast_activity_dbfs >= state->loudness_jump_rms_reference_dbfs + LVB_LOUDNESS_JUMP_FAST_RMS_MARGIN_DB;
+	state->loudness_jump_cooldown_seconds = fmaxf(0.0f, state->loudness_jump_cooldown_seconds - block_seconds);
+	if (loudness_jump_response <= LVB_LOUDNESS_JUMP_RESPONSE_MIN || settings->bypass) {
+		state->loudness_jump_candidate_seconds = 0.0f;
+		state->loudness_jump_candidate_gap_seconds = 0.0f;
+		state->loudness_jump_clear_seconds = 0.0f;
+		state->loudness_jump_active = false;
+		state->loudness_jump_armed = true;
+	} else if (!state->activity_open || activity_allows_gain <= 0.5f) {
+		state->loudness_jump_candidate_seconds = 0.0f;
+		state->loudness_jump_candidate_gap_seconds = 0.0f;
+		state->loudness_jump_clear_seconds =
+			fminf(LVB_LOUDNESS_JUMP_CLEAR_SECONDS, state->loudness_jump_clear_seconds + block_seconds);
+		state->loudness_jump_active = false;
+	} else {
+		if (state->loudness_jump_active) {
+			if (momentary_over_short_lu <= LVB_LOUDNESS_JUMP_CLEAR_LU &&
+			    state->loudness_jump_cooldown_seconds <= 0.0f) {
+				state->loudness_jump_clear_seconds += block_seconds;
+				if (state->loudness_jump_clear_seconds >= LVB_LOUDNESS_JUMP_CLEAR_SECONDS) {
+					state->loudness_jump_active = false;
+					state->loudness_jump_candidate_seconds = 0.0f;
+					state->loudness_jump_candidate_gap_seconds = 0.0f;
+				}
+			} else {
+				state->loudness_jump_clear_seconds = 0.0f;
+			}
+		} else if (momentary_over_short_lu >= LVB_LOUDNESS_JUMP_TRIGGER_LU && fast_jump_evidence) {
+			state->loudness_jump_clear_seconds = 0.0f;
+			state->loudness_jump_candidate_gap_seconds = 0.0f;
+			if (state->loudness_jump_armed) {
+				state->loudness_jump_candidate_seconds += block_seconds;
+				if (state->loudness_jump_candidate_seconds >= LVB_LOUDNESS_JUMP_CONFIRM_SECONDS) {
+					state->loudness_jump_active = true;
+					state->loudness_jump_armed = false;
+					state->loudness_jump_cooldown_seconds = LVB_LOUDNESS_JUMP_COOLDOWN_SECONDS;
+					state->loudness_jump_clear_seconds = 0.0f;
+				}
+			} else {
+				state->loudness_jump_candidate_seconds = 0.0f;
+				state->loudness_jump_candidate_gap_seconds = 0.0f;
+			}
+		} else if (momentary_over_short_lu >= LVB_LOUDNESS_JUMP_TRIGGER_LU) {
+			state->loudness_jump_candidate_gap_seconds += block_seconds;
+			if (state->loudness_jump_candidate_gap_seconds > LVB_LOUDNESS_JUMP_FAST_RMS_GAP_SECONDS) {
+				state->loudness_jump_candidate_seconds = 0.0f;
+				state->loudness_jump_candidate_gap_seconds = 0.0f;
+			}
+		} else {
+			state->loudness_jump_candidate_seconds = 0.0f;
+			state->loudness_jump_candidate_gap_seconds = 0.0f;
+			if (momentary_over_short_lu <= LVB_LOUDNESS_JUMP_CLEAR_LU)
+				state->loudness_jump_clear_seconds += block_seconds;
+			else
+				state->loudness_jump_clear_seconds = 0.0f;
+		}
+	}
+	if (!state->loudness_jump_active && state->loudness_jump_cooldown_seconds <= 0.0f &&
+	    state->loudness_jump_clear_seconds >= LVB_LOUDNESS_JUMP_CLEAR_SECONDS)
+		state->loudness_jump_armed = true;
 	/* Keep the rolling detector engaged throughout: short phrases should not briefly retarget the fader. */
 	float detector_response_factor = 1.0f;
 	if (recovery_assist_active)
 		detector_response_factor = 0.25f;
 	if (activity_reentry_active)
 		detector_response_factor = fminf(detector_response_factor, 1.0f - 0.75f * activity_reentry_ratio);
+	if (state->loudness_jump_active)
+		detector_response_factor = fminf(detector_response_factor,
+						 fmaxf(0.0f, 1.0f - (4.0f / 3.0f) * loudness_jump_response_ratio));
 	const float long_term_detector_weight = (fader_smoothness / 100.0f) * detector_response_factor;
 	const float detector_lufs =
 		input_momentary_lufs + long_term_detector_weight * (input_short_term_lufs - input_momentary_lufs);
@@ -429,18 +528,32 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	/* Peak attack remains immediate; a longer release prevents speech peaks from pumping between words. */
 	const float guard_release = expf(-1.0f / (0.300f * sample_rate));
 	const float rate_complement = 1.0f - smoothness_ratio;
-	const float downward_rate_limit = 3.0f + 80.0f * powf(rate_complement, 2.4f);
+	const float normal_downward_rate_limit = 3.0f + 80.0f * powf(rate_complement, 2.4f);
+	const float downward_rate_limit =
+		state->loudness_jump_active
+			? fminf(36.0f, normal_downward_rate_limit +
+					       LVB_LOUDNESS_JUMP_MAX_EXTRA_DOWN_RATE * loudness_jump_response_ratio)
+			: normal_downward_rate_limit;
 	const float upward_rate_limit =
 		(3.5f + 44.5f * rate_complement * rate_complement) * (recovery_assist_active ? 1.8f : 1.0f);
-	const float downward_acceleration = 36.0f + 1164.0f * rate_complement * rate_complement;
+	const float normal_downward_acceleration = 36.0f + 1164.0f * rate_complement * rate_complement;
+	const float downward_acceleration =
+		state->loudness_jump_active
+			? normal_downward_acceleration +
+				  LVB_LOUDNESS_JUMP_MAX_EXTRA_DOWN_ACCELERATION * loudness_jump_response_ratio
+			: normal_downward_acceleration;
 	const float upward_acceleration =
 		(18.0f + 282.0f * rate_complement * rate_complement) * (recovery_assist_active ? 1.8f : 1.0f);
 	const float normal_target_persistence_seconds =
 		(0.15f + 1.50f * smoothness_ratio) * (recovery_assist_active ? 0.40f : 1.0f);
 	const float reentry_target_persistence_seconds =
 		fmaxf(0.15f, normal_target_persistence_seconds * (1.0f - 0.85f * activity_reentry_ratio));
-	const float target_persistence_seconds = activity_reentry_active ? reentry_target_persistence_seconds
-									 : normal_target_persistence_seconds;
+	const float jump_target_persistence_seconds =
+		fmaxf(0.15f, normal_target_persistence_seconds * (1.0f - 0.8f * loudness_jump_response_ratio));
+	const float target_persistence_seconds =
+		activity_reentry_active ? reentry_target_persistence_seconds
+					: (state->loudness_jump_active ? jump_target_persistence_seconds
+								       : normal_target_persistence_seconds);
 	const float target_persistence_coefficient = expf(-1.0f / (target_persistence_seconds * sample_rate));
 
 	float maximum_output_peak = 0.0f;
@@ -584,6 +697,7 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	state->stats.noise_floor_dbfs = noise_floor_db;
 	state->stats.fader_smoothness = fader_smoothness;
 	state->stats.activity_reentry_speed = activity_reentry_speed;
+	state->stats.loudness_jump_response = loudness_jump_response;
 	state->stats.quiet_attenuation_db = quiet_attenuation_db;
 	state->stats.sample_rate_hz = sample_rate;
 	if (state->stats.true_peak_dbtp >= state->peak_hold_dbtp) {

@@ -35,6 +35,7 @@ static struct lvb_stats make_stats(float gain, float sample_rate)
 		.noise_floor_dbfs = -46.0f + gain,
 		.fader_smoothness = 85.0f + gain,
 		.activity_reentry_speed = 70.5f + gain,
+		.loudness_jump_response = 75.0f + gain,
 		.quiet_attenuation_db = 3.0f + gain,
 		.sample_rate_hz = sample_rate,
 		.activity_open = true,
@@ -64,7 +65,8 @@ int main(void)
 	      "first instance reads only its own values");
 	CHECK(snapshot.stats.max_boost_db == 20.5f && snapshot.stats.max_reduction_db == 15.5f &&
 		      snapshot.stats.noise_floor_dbfs == -43.5f && snapshot.stats.fader_smoothness == 87.5f &&
-		      snapshot.stats.activity_reentry_speed == 73.0f && snapshot.stats.quiet_attenuation_db == 5.5f &&
+		      snapshot.stats.activity_reentry_speed == 73.0f &&
+		      snapshot.stats.loudness_jump_response == 77.5f && snapshot.stats.quiet_attenuation_db == 5.5f &&
 		      !snapshot.stats.bypass && !snapshot.stats.peak_ceiling_limiting &&
 		      snapshot.stats.max_boost_limiting,
 	      "first snapshot keeps meter readings and effective control settings together");
@@ -76,7 +78,8 @@ int main(void)
 	      "second instance reads only its own values");
 	CHECK(snapshot.stats.max_boost_db == 14.0f && snapshot.stats.max_reduction_db == 22.0f &&
 		      snapshot.stats.noise_floor_dbfs == -50.0f && snapshot.stats.fader_smoothness == 81.0f &&
-		      snapshot.stats.activity_reentry_speed == 66.5f && snapshot.stats.quiet_attenuation_db == -1.0f &&
+		      snapshot.stats.activity_reentry_speed == 66.5f &&
+		      snapshot.stats.loudness_jump_response == 71.0f && snapshot.stats.quiet_attenuation_db == -1.0f &&
 		      snapshot.stats.bypass && snapshot.stats.peak_ceiling_limiting &&
 		      !snapshot.stats.max_boost_limiting,
 	      "second snapshot retains its own effective settings and independent limiter status flags");
