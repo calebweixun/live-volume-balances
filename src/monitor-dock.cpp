@@ -168,9 +168,16 @@ private:
 class MeterRow final : public QWidget {
 public:
 	explicit MeterRow(const QString &title, float minimum_db, float maximum_db, const char *help_key,
-			  const char *marker_format_key = nullptr, QWidget *parent = nullptr)
+			  const char *marker_format_key = nullptr, QWidget *parent = nullptr,
+			  const char *limited_marker_format_key = nullptr,
+			  const char *peak_limited_marker_format_key = nullptr,
+			  const char *boost_limited_marker_format_key = nullptr)
 		: QWidget(parent),
-		  m_marker_format_key(marker_format_key)
+		  m_marker_format_key(marker_format_key),
+		  m_help_key(help_key),
+		  m_limited_marker_format_key(limited_marker_format_key),
+		  m_peak_limited_marker_format_key(peak_limited_marker_format_key),
+		  m_boost_limited_marker_format_key(boost_limited_marker_format_key)
 	{
 		auto *layout = new QHBoxLayout(this);
 		layout->setContentsMargins(0, 0, 0, 0);
@@ -200,14 +207,35 @@ public:
 		layout->addWidget(m_value);
 	}
 
-	void setReading(float value, const QString &suffix, float marker = NAN)
+	void setReading(float value, const QString &suffix, float marker = NAN, bool peak_limited = false,
+			bool boost_limited = false)
 	{
 		m_meter->setValue(value, marker);
 		set_label_text(m_value, db_text(value, suffix.toUtf8().constData()));
-		if (m_marker_value)
-			set_label_text(
-				m_marker_value,
-				localized(m_marker_format_key).arg(db_text(marker, suffix.toUtf8().constData())));
+		if (m_marker_value) {
+			const bool show_peak_limited = peak_limited && m_peak_limited_marker_format_key;
+			const bool show_boost_limited = boost_limited && m_boost_limited_marker_format_key;
+			const bool show_limited = peak_limited && boost_limited && m_limited_marker_format_key;
+			const char *format_key = m_marker_format_key;
+			const char *help_key = m_help_key;
+			if (show_limited) {
+				format_key = m_limited_marker_format_key;
+				help_key = "TargetLufsBothLimitedHelp";
+			} else if (show_peak_limited) {
+				format_key = m_peak_limited_marker_format_key;
+				help_key = "TargetLufsPeakLimitedHelp";
+			} else if (show_boost_limited) {
+				format_key = m_boost_limited_marker_format_key;
+				help_key = "TargetLufsBoostLimitedHelp";
+			}
+			const QString reading = localized(format_key).arg(db_text(marker, suffix.toUtf8().constData()));
+			set_label_text(m_marker_value, reading);
+			const QString help = localized(help_key);
+			if (m_marker_value->toolTip() != help)
+				m_marker_value->setToolTip(help);
+			if (m_meter->toolTip() != help)
+				m_meter->setToolTip(help);
+		}
 	}
 
 	void setBypassed(bool bypassed) { m_meter->setBypassed(bypassed); }
@@ -218,6 +246,10 @@ private:
 	QLabel *m_value = nullptr;
 	SegmentedMeter *m_meter = nullptr;
 	const char *m_marker_format_key = nullptr;
+	const char *m_help_key = nullptr;
+	const char *m_limited_marker_format_key = nullptr;
+	const char *m_peak_limited_marker_format_key = nullptr;
+	const char *m_boost_limited_marker_format_key = nullptr;
 };
 
 class GainMeter final : public QWidget {
@@ -231,11 +263,13 @@ public:
 		m_tooltip = localized("GainBarHelp");
 	}
 
-	const QString &setAdvancedSettingsTooltip(float fader_smoothness, float quiet_attenuation_db)
+	const QString &setAdvancedSettingsTooltip(float fader_smoothness, float activity_reentry_speed,
+						  float quiet_attenuation_db)
 	{
 		const QString next_tooltip = localized("GainBarHelp") + QStringLiteral("\n") +
 					     localized("GainAdvancedSettingsTooltipFormat")
 						     .arg(fader_smoothness, 0, 'f', 0)
+						     .arg(activity_reentry_speed, 0, 'f', 0)
 						     .arg(quiet_attenuation_db, 0, 'f', 1);
 		if (m_tooltip != next_tooltip) {
 			m_tooltip = next_tooltip;
@@ -359,7 +393,9 @@ public:
 		m_output_fast =
 			new MeterRow(localized("MonitorOutputFast"), -60.0f, 0.0f, "FastMeterHelp", nullptr, this);
 		m_output_lufs = new MeterRow(localized("MonitorOutputMomentary"), -60.0f, 0.0f, "TargetLufsRailHelp",
-					     "TargetLufsReadoutFormat", this);
+					     "TargetLufsReadoutFormat", this, "TargetLufsLimitedReadoutFormat",
+					     "TargetLufsPeakLimitedReadoutFormat",
+					     "TargetLufsBoostLimitedReadoutFormat");
 		layout->addWidget(m_input);
 		layout->addWidget(m_output_fast);
 		layout->addWidget(m_output_lufs);
@@ -486,7 +522,8 @@ public:
 		m_input->setBypassed(stats.bypass);
 		m_output_fast->setReading(stats.output_fast_rms_dbfs, QStringLiteral("dBFS"));
 		m_output_fast->setBypassed(stats.bypass);
-		m_output_lufs->setReading(stats.output_momentary_lufs, QStringLiteral("LUFS"), stats.target_lufs);
+		m_output_lufs->setReading(stats.output_momentary_lufs, QStringLiteral("LUFS"), stats.target_lufs,
+					  stats.peak_ceiling_limiting, stats.max_boost_limiting);
 		m_output_lufs->setBypassed(stats.bypass);
 		set_label_text(m_momentary,
 			       localized("MonitorMomentaryFormat").arg(db_text(stats.input_momentary_lufs, "LUFS")));
@@ -499,8 +536,8 @@ public:
 		set_label_text(m_gain_value, gain_text);
 		m_gain_meter->setReading(stats.gain_db, stats.max_reduction_db, stats.max_boost_db);
 		m_gain_meter->setBypassed(stats.bypass);
-		const QString &gain_tooltip =
-			m_gain_meter->setAdvancedSettingsTooltip(stats.fader_smoothness, stats.quiet_attenuation_db);
+		const QString &gain_tooltip = m_gain_meter->setAdvancedSettingsTooltip(
+			stats.fader_smoothness, stats.activity_reentry_speed, stats.quiet_attenuation_db);
 		if (m_gain_value->toolTip() != gain_tooltip)
 			m_gain_value->setToolTip(gain_tooltip);
 		set_label_text(m_gain_minimum,
@@ -538,8 +575,8 @@ protected:
 private:
 	void showInfo()
 	{
-		QMessageBox box(QMessageBox::Information, localized("InfoTitle"), localized("InfoText"),
-				QMessageBox::Ok, this);
+		const QString info_text = localized("InfoText") + QStringLiteral("\n\n") + localized("FilterStageInfo");
+		QMessageBox box(QMessageBox::Information, localized("InfoTitle"), info_text, QMessageBox::Ok, this);
 		box.setTextFormat(Qt::PlainText);
 		box.exec();
 	}

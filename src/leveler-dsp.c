@@ -18,6 +18,8 @@
 #define LVB_ACTIVITY_RELATIVE_DB 12.0f
 #define LVB_ACTIVITY_OPEN_MARGIN_DB 6.0f
 #define LVB_ACTIVITY_REFERENCE_MARGIN_DB 3.0f
+#define LVB_ACTIVITY_REENTRY_CONFIRM_SECONDS 0.040f
+#define LVB_ACTIVITY_REENTRY_RAMP_SECONDS 2.0f
 #define LVB_PEAK_RIDER_HEADROOM_DB 0.5f
 #define LVB_NEPER_PER_DB 0.1151292546497022842
 
@@ -208,6 +210,8 @@ static float update_activity(struct lvb_state *state, float level_dbfs, float fl
 		state->activity_hold_seconds -= elapsed_seconds;
 	} else {
 		state->activity_hold_seconds = 0.0f;
+		if (state->activity_open)
+			state->activity_reentry_armed = true;
 		state->activity_open = false;
 	}
 
@@ -301,6 +305,9 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	const float noise_floor_db = clampf(settings->noise_floor_db, -100.0f, -6.0f);
 	const float fader_smoothness =
 		clampf(settings->fader_smoothness, LVB_FADER_SMOOTHNESS_MIN, LVB_FADER_SMOOTHNESS_MAX);
+	const float activity_reentry_speed = clampf(settings->activity_reentry_speed, LVB_ACTIVITY_REENTRY_SPEED_MIN,
+						    LVB_ACTIVITY_REENTRY_SPEED_MAX);
+	const float activity_reentry_ratio = activity_reentry_speed / LVB_ACTIVITY_REENTRY_SPEED_MAX;
 	const float quiet_attenuation_db =
 		clampf(settings->quiet_attenuation_db, LVB_QUIET_ATTENUATION_MIN, LVB_QUIET_ATTENUATION_MAX);
 	const float peak_ceiling_db = clampf(settings->peak_ceiling_db, -24.0f, 0.0f);
@@ -343,6 +350,28 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	const float block_seconds = (float)((double)frames / sample_rate);
 	const float fast_activity_dbfs = energy_to_dbfs(state->activity_energy);
 	const float activity_allows_gain = update_activity(state, fast_activity_dbfs, noise_floor_db, block_seconds);
+	if (activity_allows_gain > 0.5f) {
+		if (state->activity_reentry_armed && state->activity_reentry_seconds <= 0.0f)
+			state->activity_reentry_pending = true;
+		if (state->activity_reentry_pending) {
+			state->activity_reentry_candidate_seconds += block_seconds;
+			if (state->activity_reentry_candidate_seconds >= LVB_ACTIVITY_REENTRY_CONFIRM_SECONDS) {
+				state->activity_reentry_seconds = LVB_ACTIVITY_REENTRY_RAMP_SECONDS;
+				state->activity_reentry_candidate_seconds = 0.0f;
+				state->activity_reentry_pending = false;
+				state->activity_reentry_armed = false;
+			}
+		}
+	} else if (state->activity_reentry_pending) {
+		state->activity_reentry_candidate_seconds = 0.0f;
+	}
+	if (!state->activity_open || settings->bypass) {
+		state->activity_reentry_pending = false;
+		state->activity_reentry_candidate_seconds = 0.0f;
+		state->activity_reentry_seconds = 0.0f;
+		if (settings->bypass)
+			state->activity_reentry_armed = false;
+	}
 	if (!settings->bypass && activity_allows_gain <= 0.5f && state->activity_open) {
 		/* Freeze the actual fader position during word gaps, not just its previous destination. */
 		state->gain_target_db = state->gain_db;
@@ -357,17 +386,26 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	else
 		state->quiet_transition_seconds = 0.0f;
 	const bool recovery_assist_active = state->quiet_transition_seconds >= 0.80f;
+	const bool activity_reentry_active = state->activity_reentry_seconds > 0.0f && state->activity_open;
 	/* Keep the rolling detector engaged throughout: short phrases should not briefly retarget the fader. */
-	const float long_term_detector_weight = (fader_smoothness / 100.0f) * (recovery_assist_active ? 0.25f : 1.0f);
+	float detector_response_factor = 1.0f;
+	if (recovery_assist_active)
+		detector_response_factor = 0.25f;
+	if (activity_reentry_active)
+		detector_response_factor = fminf(detector_response_factor, 1.0f - 0.75f * activity_reentry_ratio);
+	const float long_term_detector_weight = (fader_smoothness / 100.0f) * detector_response_factor;
 	const float detector_lufs =
 		input_momentary_lufs + long_term_detector_weight * (input_short_term_lufs - input_momentary_lufs);
 	float requested_gain_db = (float)state->gain_target_db;
+	bool boost_request_exceeds_max = false;
 	if (activity_allows_gain > 0.5f) {
 		const float difference_db = target_lufs - detector_lufs;
-		if (difference_db >= 0.0f)
+		if (difference_db >= 0.0f) {
+			boost_request_exceeds_max = difference_db > max_boost_db + 0.5f;
 			requested_gain_db = fminf(difference_db, max_boost_db);
-		else
+		} else {
 			requested_gain_db = -soft_knee_reduction(-difference_db, 10.0f, 1.5f);
+		}
 		requested_gain_db = clampf(requested_gain_db, -max_reduction_db, max_boost_db);
 	} else if (!state->activity_open) {
 		/* Long quiet periods settle at the configured attenuation on this fader. */
@@ -397,8 +435,12 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	const float downward_acceleration = 36.0f + 1164.0f * rate_complement * rate_complement;
 	const float upward_acceleration =
 		(18.0f + 282.0f * rate_complement * rate_complement) * (recovery_assist_active ? 1.8f : 1.0f);
-	const float target_persistence_seconds =
+	const float normal_target_persistence_seconds =
 		(0.15f + 1.50f * smoothness_ratio) * (recovery_assist_active ? 0.40f : 1.0f);
+	const float reentry_target_persistence_seconds =
+		fmaxf(0.15f, normal_target_persistence_seconds * (1.0f - 0.85f * activity_reentry_ratio));
+	const float target_persistence_seconds = activity_reentry_active ? reentry_target_persistence_seconds
+									 : normal_target_persistence_seconds;
 	const float target_persistence_coefficient = expf(-1.0f / (target_persistence_seconds * sample_rate));
 
 	float maximum_output_peak = 0.0f;
@@ -442,11 +484,19 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 			} else {
 				const double remaining_db = state->gain_target_db - state->gain_db;
 				float desired_rate = (float)(remaining_db / fader_response_seconds);
-				desired_rate = clampf(desired_rate, -downward_rate_limit, upward_rate_limit);
+				const float current_upward_rate_limit =
+					activity_reentry_active ? upward_rate_limit + 30.0f * activity_reentry_ratio *
+											      activity_reentry_ratio
+								: upward_rate_limit;
+				desired_rate = clampf(desired_rate, -downward_rate_limit, current_upward_rate_limit);
 				if (desired_rate * state->gain_rate_db_per_second < 0.0f)
 					state->gain_rate_db_per_second = 0.0f;
-				const float acceleration = remaining_db < 0.0f ? downward_acceleration
-									       : upward_acceleration;
+				const float reentry_acceleration =
+					upward_acceleration * (1.0f + 2.0f * activity_reentry_ratio);
+				const float acceleration = remaining_db < 0.0f
+								   ? downward_acceleration
+								   : (activity_reentry_active ? reentry_acceleration
+											      : upward_acceleration);
 				const float max_rate_step = acceleration / sample_rate;
 				const float rate_error = desired_rate - state->gain_rate_db_per_second;
 				state->gain_rate_db_per_second += clampf(rate_error, -max_rate_step, max_rate_step);
@@ -469,6 +519,9 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 				state->peak_guard_gain = desired_guard_gain +
 							 guard_release * (state->peak_guard_gain - desired_guard_gain);
 		}
+		if (activity_reentry_active)
+			state->activity_reentry_seconds =
+				fmaxf(0.0f, state->activity_reentry_seconds - 1.0f / sample_rate);
 
 		double applied_gain = settings->bypass ? 1.0 : state->gain * state->peak_guard_gain;
 		last_applied_gain = applied_gain;
@@ -530,6 +583,7 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	state->stats.max_reduction_db = max_reduction_db;
 	state->stats.noise_floor_dbfs = noise_floor_db;
 	state->stats.fader_smoothness = fader_smoothness;
+	state->stats.activity_reentry_speed = activity_reentry_speed;
 	state->stats.quiet_attenuation_db = quiet_attenuation_db;
 	state->stats.sample_rate_hz = sample_rate;
 	if (state->stats.true_peak_dbtp >= state->peak_hold_dbtp) {
@@ -546,4 +600,21 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	state->stats.gain_db = settings->bypass ? 0.0f : (float)linear_to_db(last_applied_gain);
 	state->stats.activity_open = state->activity_open;
 	state->stats.bypass = settings->bypass;
+	const bool was_peak_limited = state->peak_ceiling_limiting;
+	const bool was_boost_limited = state->max_boost_limiting;
+	const float peak_ceiling_gain_restriction_db = requested_gain_db - peak_aware_target_db;
+	const float output_below_target_db = target_lufs - state->stats.output_momentary_lufs;
+	const bool peak_cap_engaged = state->peak_guard_gain < db_to_linear(-0.5f) ||
+				      fabs(state->gain_db - peak_aware_target_db) <= 1.0;
+	const bool main_gain_at_boost_cap = state->gain_db >= max_boost_db - 1.0f;
+	state->peak_ceiling_limiting = !settings->bypass && activity_allows_gain > 0.5f &&
+				       state->stats.output_momentary_lufs > -119.0f && peak_cap_engaged &&
+				       peak_ceiling_gain_restriction_db >= (was_peak_limited ? 0.5f : 1.0f) &&
+				       output_below_target_db >= (was_peak_limited ? 1.0f : 2.0f);
+	state->max_boost_limiting = !settings->bypass && activity_allows_gain > 0.5f &&
+				    state->stats.output_momentary_lufs > -119.0f && main_gain_at_boost_cap &&
+				    boost_request_exceeds_max &&
+				    output_below_target_db >= (was_boost_limited ? 1.0f : 2.0f);
+	state->stats.peak_ceiling_limiting = state->peak_ceiling_limiting;
+	state->stats.max_boost_limiting = state->max_boost_limiting;
 }

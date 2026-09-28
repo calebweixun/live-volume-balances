@@ -26,6 +26,7 @@ static struct lvb_settings test_settings(void)
 		.max_reduction_db = 18.0f,
 		.noise_floor_db = -46.0f,
 		.fader_smoothness = LVB_FADER_SMOOTHNESS_DEFAULT,
+		.activity_reentry_speed = LVB_ACTIVITY_REENTRY_SPEED_DEFAULT,
 		.quiet_attenuation_db = 0.0f,
 		.peak_ceiling_db = -1.0f,
 		.bypass = false,
@@ -363,6 +364,159 @@ static int test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely(void)
 	      "gain riding should lower gain within a second when a loud band starts");
 	CHECK(peak <= settings.peak_ceiling_db + 0.35f,
 	      "the output peak guard should remain active during transitions");
+	return 0;
+}
+
+static int test_screenshot_settings_show_net_band_onset_and_peak_limited_target(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.target_lufs = -10.0f;
+	settings.max_boost_db = 17.0f;
+	settings.max_reduction_db = 12.5f;
+	settings.noise_floor_db = -50.0f;
+	settings.fader_smoothness = 85.0f;
+	settings.quiet_attenuation_db = 3.0f;
+	settings.peak_ceiling_db = -7.1f;
+
+	struct lvb_state onset_state;
+	lvb_state_init(&onset_state);
+	process_segment(&onset_state, &settings, 48000.0f, 440.0f, 0.025f, 48000U * 8U, 0, NULL);
+	CHECK(onset_state.gain_db > 10.0, "screenshot settings should establish boosted gain during quiet speech");
+	float onset_peak_dbtp = -120.0f;
+	process_segment(&onset_state, &settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &onset_peak_dbtp);
+	CHECK(onset_state.gain_db > 0.0,
+	      "the smooth main fader should remain positive briefly as it begins a large downward transition");
+	CHECK(onset_state.stats.gain_db < 0.0f,
+	      "the displayed net gain should include the fast peak guard and turn negative on a high-level band onset");
+	CHECK(onset_peak_dbtp <= settings.peak_ceiling_db + 0.35f,
+	      "the band-onset peak guard should keep the output near the configured ceiling");
+
+	struct lvb_state peak_limited_state;
+	lvb_state_init(&peak_limited_state);
+	process_segment(&peak_limited_state, &settings, 48000.0f, 440.0f, 0.025f, 48000U * 8U, 0, NULL);
+	float samples[4800];
+	float *planes[] = {samples};
+	uint32_t frame_position = 48000U * 8U;
+	float maximum_peak_hold_dbtp = -120.0f;
+	for (size_t block = 0; block < 80; block++) {
+		for (size_t i = 0; i < 4800; i++) {
+			const uint32_t frame = frame_position + (uint32_t)i;
+			float sample = 0.08f * sinf(6.28318530717958647692f * 440.0f * (float)frame / 48000.0f);
+			if (i < 480U)
+				sample += 0.8f * sinf(6.28318530717958647692f * 1100.0f * (float)frame / 48000.0f);
+			samples[i] = sample;
+		}
+		lvb_process(&peak_limited_state, &settings, 1, planes, 4800, 48000.0f);
+		if (peak_limited_state.stats.peak_hold_dbtp > maximum_peak_hold_dbtp)
+			maximum_peak_hold_dbtp = peak_limited_state.stats.peak_hold_dbtp;
+		frame_position += 4800U;
+	}
+	CHECK(peak_limited_state.stats.peak_ceiling_limiting,
+	      "the dock should identify when peak headroom prevents an under-target rolling output from reaching its goal");
+	CHECK(peak_limited_state.stats.output_momentary_lufs < settings.target_lufs - 5.0f,
+	      "a high-crest program can remain well below target even while its peaks reach the safety ceiling");
+	CHECK(peak_limited_state.stats.gain_db < 0.0f,
+	      "net applied gain should become negative after the fader takes over sustained peak-ceiling work");
+	CHECK(maximum_peak_hold_dbtp <= settings.peak_ceiling_db + 0.35f,
+	      "peak-aware rider and FIR guard must keep the high-crest program within the configured peak ceiling");
+
+	struct lvb_settings boost_limited_settings = test_settings();
+	boost_limited_settings.target_lufs = -14.0f;
+	boost_limited_settings.max_boost_db = 12.0f;
+	boost_limited_settings.noise_floor_db = -50.0f;
+	boost_limited_settings.peak_ceiling_db = 0.0f;
+	struct lvb_state boost_limited_state;
+	lvb_state_init(&boost_limited_state);
+	process_segment(&boost_limited_state, &boost_limited_settings, 48000.0f, 900.0f, 0.025f, 48000U / 5U, 0, NULL);
+	CHECK(!boost_limited_state.stats.max_boost_limiting,
+	      "the target cue should stay off while the main fader is still ramping toward its boost cap");
+	process_segment(&boost_limited_state, &boost_limited_settings, 48000.0f, 900.0f, 0.025f, 48000U * 8U, 0, NULL);
+	CHECK(boost_limited_state.stats.max_boost_limiting && !boost_limited_state.stats.peak_ceiling_limiting,
+	      "a quiet input that reaches the +12 dB cap should report BOOST, distinct from peak-ceiling limiting");
+	CHECK(boost_limited_state.gain_db >= 11.0 && boost_limited_state.gain_db <= 12.1,
+	      "BOOST should appear only when the actual main fader is close to its configured cap");
+	return 0;
+}
+
+static void prepare_closed_reentry_state(struct lvb_state *state, const struct lvb_settings *settings)
+{
+	process_sermon_with_room_noise(state, settings, 0, 48000U * 2U, true, 0.025f, 0.0f, NULL, NULL);
+	process_noise_segment(state, settings, 48000.0f, 0.0f, 48000U * 6U, 0, NULL);
+}
+
+static int test_activity_reentry_speed_is_separate_and_noise_safe(void)
+{
+	struct lvb_settings slow_settings = test_settings();
+	slow_settings.target_lufs = -14.0f;
+	slow_settings.max_boost_db = 12.0f;
+	slow_settings.max_reduction_db = 12.5f;
+	slow_settings.noise_floor_db = -50.0f;
+	slow_settings.fader_smoothness = 85.0f;
+	slow_settings.activity_reentry_speed = 0.0f;
+	slow_settings.quiet_attenuation_db = 3.0f;
+	slow_settings.peak_ceiling_db = -1.0f;
+	struct lvb_settings fast_settings = slow_settings;
+	fast_settings.activity_reentry_speed = LVB_ACTIVITY_REENTRY_SPEED_DEFAULT;
+	struct lvb_settings fastest_settings = slow_settings;
+	fastest_settings.activity_reentry_speed = LVB_ACTIVITY_REENTRY_SPEED_MAX;
+	struct lvb_state slow_state, fast_state, fastest_state;
+	lvb_state_init(&slow_state);
+	lvb_state_init(&fast_state);
+	lvb_state_init(&fastest_state);
+	prepare_closed_reentry_state(&slow_state, &slow_settings);
+	prepare_closed_reentry_state(&fast_state, &fast_settings);
+	prepare_closed_reentry_state(&fastest_state, &fastest_settings);
+	CHECK(!slow_state.stats.activity_open && !fast_state.stats.activity_open && !fastest_state.stats.activity_open,
+	      "the re-entry comparison must start after the same closed activity gate");
+	CHECK(fabsf((float)slow_state.gain_db - (float)fast_state.gain_db) < 0.05f &&
+		      fabsf((float)slow_state.gain_db - (float)fastest_state.gain_db) < 0.05f,
+	      "re-entry speed should not change initial startup or the settled quiet endpoint");
+
+	float slow_peak = -120.0f, fast_peak = -120.0f, fastest_peak = -120.0f;
+	process_sermon_with_room_noise(&slow_state, &slow_settings, 0, 48000U / 2U, true, 0.025f, 0.0f, NULL,
+				       &slow_peak);
+	process_sermon_with_room_noise(&fast_state, &fast_settings, 0, 48000U / 2U, true, 0.025f, 0.0f, NULL,
+				       &fast_peak);
+	process_sermon_with_room_noise(&fastest_state, &fastest_settings, 0, 48000U / 2U, true, 0.025f, 0.0f, NULL,
+				       &fastest_peak);
+	CHECK(fast_state.gain_db > slow_state.gain_db + 1.5,
+	      "default re-entry speed should regain useful gain faster than normal smoothness during the first 500 ms");
+	CHECK(fastest_state.gain_db > fast_state.gain_db + 0.5,
+	      "maximum re-entry speed should recover more quickly than the default without changing the main smoothness setting");
+	CHECK(fast_state.stats.output_momentary_lufs > slow_state.stats.output_momentary_lufs + 0.5f,
+	      "faster confirmed re-entry should improve the first half-second rolling output level");
+	CHECK(slow_peak <= slow_settings.peak_ceiling_db + 0.35f &&
+		      fast_peak <= fast_settings.peak_ceiling_db + 0.35f &&
+		      fastest_peak <= fastest_settings.peak_ceiling_db + 0.35f,
+	      "re-entry assistance must preserve the same FIR peak ceiling");
+
+	struct lvb_state noise_state;
+	lvb_state_init(&noise_state);
+	prepare_closed_reentry_state(&noise_state, &fast_settings);
+	const float gain_at_quiet_endpoint = noise_state.stats.gain_db;
+	const float floor_plus_five = db_to_linear(-45.0f) * sqrtf(3.0f);
+	process_noise_segment(&noise_state, &fastest_settings, 48000.0f, floor_plus_five, 48000U * 4U, 0, NULL);
+	CHECK(!noise_state.stats.activity_open && noise_state.activity_reentry_seconds == 0.0f &&
+		      noise_state.stats.gain_db <= gain_at_quiet_endpoint + 0.5f,
+	      "steady −45 dBFS room ambience must neither open the gate nor arm faster re-entry or upward gain");
+
+	struct lvb_state slow_band_state, fast_band_state, fastest_band_state;
+	lvb_state_init(&slow_band_state);
+	lvb_state_init(&fast_band_state);
+	lvb_state_init(&fastest_band_state);
+	prepare_closed_reentry_state(&slow_band_state, &slow_settings);
+	prepare_closed_reentry_state(&fast_band_state, &fast_settings);
+	prepare_closed_reentry_state(&fastest_band_state, &fastest_settings);
+	process_segment(&slow_band_state, &slow_settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &slow_peak);
+	process_segment(&fast_band_state, &fast_settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &fast_peak);
+	process_segment(&fastest_band_state, &fastest_settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &fastest_peak);
+	CHECK(fabs((double)slow_band_state.gain_db - fast_band_state.gain_db) < 1.0 &&
+		      fabs((double)slow_band_state.gain_db - fastest_band_state.gain_db) < 1.0,
+	      "the re-entry speed should not materially slow downward gain response on sudden full-band onset");
+	CHECK(slow_peak <= slow_settings.peak_ceiling_db + 0.35f &&
+		      fast_peak <= fast_settings.peak_ceiling_db + 0.35f &&
+		      fastest_peak <= fastest_settings.peak_ceiling_db + 0.35f,
+	      "sudden full-band onset must remain under the peak ceiling at both re-entry speed settings");
 	return 0;
 }
 
@@ -797,6 +951,10 @@ int main(void)
 	      "small per-sample gain steps preserve linear and dB precision");
 	CHECK(test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely() == 0,
 	      "quiet sermon to full-band transition");
+	CHECK(test_screenshot_settings_show_net_band_onset_and_peak_limited_target() == 0,
+	      "screenshot settings show net gain at band onset and target limited by peak ceiling");
+	CHECK(test_activity_reentry_speed_is_separate_and_noise_safe() == 0,
+	      "activity re-entry speed improves speech reacquisition without lifting room noise or delaying band reduction");
 	CHECK(test_speech_gaps_hold_fader_and_floor_plus_two_does_not_reopen() == 0,
 	      "short speech gaps, held fader, quiet endpoint and noise-floor behavior");
 	CHECK(test_ambiguous_room_noise_does_not_extend_activity_hangover() == 0,
