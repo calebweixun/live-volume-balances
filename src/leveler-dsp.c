@@ -294,7 +294,7 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	if (fabsf(state->sample_rate - sample_rate) > 0.5f)
 		configure_k_weighting(state, sample_rate);
 
-	const float target_lufs = clampf(settings->target_lufs, -36.0f, -6.0f);
+	const float target_lufs = clampf(settings->target_lufs, LVB_TARGET_LUFS_MIN, LVB_TARGET_LUFS_MAX);
 	const float max_boost_db = clampf(settings->max_boost_db, 0.0f, 36.0f);
 	const float max_reduction_db = clampf(settings->max_reduction_db, 0.0f, 36.0f);
 	const float attack_ms = clampf(settings->attack_ms, 10.0f, 3000.0f);
