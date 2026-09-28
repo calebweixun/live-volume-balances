@@ -28,6 +28,8 @@ struct lvb_settings {
 };
 
 struct lvb_stats {
+	float input_fast_rms_dbfs;
+	float output_fast_rms_dbfs;
 	float input_momentary_lufs;
 	float input_short_term_lufs;
 	float output_momentary_lufs;
@@ -37,6 +39,7 @@ struct lvb_stats {
 	float gain_db;
 	float target_lufs;
 	float peak_ceiling_dbtp;
+	float sample_rate_hz;
 	bool activity_open;
 };
 
@@ -66,11 +69,15 @@ struct lvb_state {
 	float sample_rate;
 	float activity_energy_coefficient;
 	float activity_gain_coefficient;
+	float fast_meter_attack_coefficient;
+	float fast_meter_release_coefficient;
 	float activity_reference_dbfs;
 	float activity_hold_seconds;
 	float peak_hold_dbtp;
 	float peak_hold_seconds;
 	double activity_energy;
+	double input_fast_meter_energy;
+	double output_fast_meter_energy;
 	uint32_t bucket_frames;
 	uint32_t true_peak_history_index;
 	uint32_t output_peak_history_index;
@@ -94,8 +101,13 @@ struct lvb_state {
 	struct lvb_stats stats;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void lvb_state_init(struct lvb_state *state);
 void lvb_get_stats(const struct lvb_state *state, struct lvb_stats *stats);
+float lvb_output_latency_ms(float sample_rate);
 
 /*
  * Process planar float audio with linked-channel, rolling K-weighted loudness
@@ -106,3 +118,7 @@ void lvb_get_stats(const struct lvb_state *state, struct lvb_stats *stats);
  */
 void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, size_t channels, float *const *audio,
 		 size_t frames, float sample_rate);
+
+#ifdef __cplusplus
+}
+#endif

@@ -8,8 +8,9 @@
 #include <obs-module.h>
 
 #include <QColor>
-#include <QComboBox>
+#include <QElapsedTimer>
 #include <QFrame>
+#include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMessageBox>
@@ -19,16 +20,18 @@
 #include <QPalette>
 #include <QPointF>
 #include <QRectF>
-#include <QSignalBlocker>
+#include <QResizeEvent>
 #include <QSizePolicy>
+#include <QScrollArea>
 #include <QTimer>
 #include <QToolButton>
-#include <QVariant>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 #include "monitor-bridge.h"
 
@@ -48,20 +51,32 @@ QString db_text(float value, const char *suffix)
 	return QStringLiteral("%1 %2").arg(value, 0, 'f', 1).arg(QString::fromUtf8(suffix));
 }
 
+void set_label_text(QLabel *label, const QString &text)
+{
+	if (label && label->text() != text)
+		label->setText(text);
+}
+
 class SegmentedMeter final : public QWidget {
 public:
 	explicit SegmentedMeter(QWidget *parent = nullptr) : QWidget(parent)
 	{
-		setMinimumHeight(12);
-		setMaximumHeight(14);
+		setMinimumHeight(10);
+		setMaximumHeight(12);
 		setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-		setToolTip(QStringLiteral("-60 dB to 0 dB"));
+		setToolTip(localized("MeterRangeHelp"));
 	}
 
 	void setValue(float value, float marker = NAN)
 	{
-		m_value = std::isfinite(value) ? value : -120.0f;
-		m_marker = std::isfinite(marker) ? marker : NAN;
+		const float next_value = std::isfinite(value) ? value : -120.0f;
+		const float next_marker = std::isfinite(marker) ? marker : NAN;
+		const bool marker_changed = std::isfinite(next_marker) != std::isfinite(m_marker) ||
+					    (std::isfinite(next_marker) && std::fabs(next_marker - m_marker) >= 0.1f);
+		if (std::fabs(next_value - m_value) < 0.1f && !marker_changed)
+			return;
+		m_value = next_value;
+		m_marker = next_marker;
 		update();
 	}
 
@@ -121,25 +136,26 @@ public:
 	{
 		auto *layout = new QHBoxLayout(this);
 		layout->setContentsMargins(0, 0, 0, 0);
-		layout->setSpacing(7);
+		layout->setSpacing(5);
 		m_title = new QLabel(title, this);
-		m_title->setMinimumWidth(78);
-		m_title->setMaximumWidth(82);
+		m_title->setMinimumWidth(62);
+		m_title->setMaximumWidth(72);
 		m_title->setStyleSheet(QStringLiteral("font-size: 11px; font-weight: 600;"));
 		m_meter = new SegmentedMeter(this);
+		m_meter->setToolTip(localized("FastMeterHelp"));
 		m_value = new QLabel(QStringLiteral("—"), this);
 		m_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-		m_value->setMinimumWidth(57);
+		m_value->setMinimumWidth(76);
 		m_value->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
 		layout->addWidget(m_title);
 		layout->addWidget(m_meter, 1);
 		layout->addWidget(m_value);
 	}
 
-	void setReading(float value, float marker, const QString &suffix)
+	void setReading(float value, const QString &suffix)
 	{
-		m_meter->setValue(value, marker);
-		m_value->setText(db_text(value, suffix.toUtf8().constData()));
+		m_meter->setValue(value);
+		set_label_text(m_value, db_text(value, suffix.toUtf8().constData()));
 	}
 
 private:
@@ -148,102 +164,154 @@ private:
 	SegmentedMeter *m_meter = nullptr;
 };
 
-class ValueCard final : public QFrame {
+class SourceMonitorWidget final : public QFrame {
 public:
-	explicit ValueCard(const QString &title, QWidget *parent = nullptr) : QFrame(parent)
+	explicit SourceMonitorWidget(const lvb_monitor_source &source, QWidget *parent = nullptr)
+		: QFrame(parent),
+		  m_source(source)
 	{
 		setFrameShape(QFrame::StyledPanel);
 		setFrameShadow(QFrame::Plain);
+		setMinimumWidth(340);
 		auto *layout = new QVBoxLayout(this);
-		layout->setContentsMargins(9, 7, 9, 7);
-		layout->setSpacing(1);
-		m_title = new QLabel(title, this);
-		m_title->setStyleSheet(QStringLiteral("font-size: 11px; font-weight: 600;"));
-		m_value = new QLabel(QStringLiteral("—"), this);
-		m_value->setStyleSheet(
-			QStringLiteral("font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums;"));
-		layout->addWidget(m_title);
-		layout->addWidget(m_value);
-	}
-
-	void setValue(const QString &value) { m_value->setText(value); }
-
-private:
-	QLabel *m_title = nullptr;
-	QLabel *m_value = nullptr;
-};
-
-class MonitorWidget final : public QWidget {
-public:
-	MonitorWidget()
-	{
-		setMinimumWidth(320);
-		setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
-		auto *layout = new QVBoxLayout(this);
-		layout->setContentsMargins(10, 8, 10, 10);
-		layout->setSpacing(8);
+		layout->setContentsMargins(6, 4, 6, 4);
+		layout->setSpacing(2);
 
 		auto *header = new QHBoxLayout();
 		header->setContentsMargins(0, 0, 0, 0);
-		m_title = new QLabel(localized("LiveVolumeBalancer"), this);
-		m_title->setStyleSheet(QStringLiteral("font-size: 13px; font-weight: 700;"));
+		header->setSpacing(4);
+		m_name = new QLabel(QString::fromUtf8(source.name), this);
+		m_name->setStyleSheet(QStringLiteral("font-size: 12px; font-weight: 700;"));
+		m_name->setMinimumWidth(0);
+		m_name->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+		m_name->setToolTip(QString::fromUtf8(source.name));
 		m_status_dot = new QLabel(QStringLiteral("●"), this);
 		m_status_dot->setStyleSheet(QStringLiteral("font-size: 11px;"));
 		m_status = new QLabel(localized("MonitorWaiting"), this);
 		m_status->setStyleSheet(QStringLiteral("font-size: 11px; font-weight: 600;"));
+		m_settings = new QToolButton(this);
+		m_settings->setText(QStringLiteral("⚙"));
+		m_settings->setToolTip(localized("OpenFilterSettings"));
+		m_settings->setAccessibleName(localized("OpenFilterSettings"));
+		m_settings->setAutoRaise(true);
 		m_info = new QToolButton(this);
 		m_info->setText(QStringLiteral("ⓘ"));
 		m_info->setToolTip(localized("InfoTooltip"));
 		m_info->setAccessibleName(localized("InfoTooltip"));
 		m_info->setAutoRaise(true);
-		header->addWidget(m_title);
-		header->addStretch(1);
+		header->addWidget(m_name, 1);
 		header->addWidget(m_status_dot);
 		header->addWidget(m_status);
+		header->addWidget(m_settings);
 		header->addWidget(m_info);
 		layout->addLayout(header);
 
-		m_source = new QComboBox(this);
-		m_source->setVisible(false);
-		m_source->setToolTip(localized("MonitorSource"));
-		layout->addWidget(m_source);
-		m_input = new MeterRow(localized("MonitorInput"), this);
-		m_input_short = new QLabel(QStringLiteral("—"), this);
-		m_output = new MeterRow(localized("MonitorOutput"), this);
-		m_output_short = new QLabel(QStringLiteral("—"), this);
-		for (QLabel *label : {m_input_short, m_output_short}) {
-			label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-			label->setStyleSheet(QStringLiteral("font-size: 11px;"));
-		}
+		m_input = new MeterRow(localized("MonitorInputFast"), this);
+		m_output = new MeterRow(localized("MonitorOutputFast"), this);
 		layout->addWidget(m_input);
-		layout->addWidget(m_input_short);
 		layout->addWidget(m_output);
-		layout->addWidget(m_output_short);
 
-		auto *cards = new QHBoxLayout();
-		cards->setSpacing(7);
-		m_gain_card = new ValueCard(localized("MonitorGain"), this);
-		m_peak_card = new ValueCard(localized("MonitorPeakHold"), this);
-		m_peak_details = new QLabel(QStringLiteral("—"), this);
-		m_peak_details->setStyleSheet(QStringLiteral("font-size: 11px;"));
+		m_momentary = new QLabel(localized("MonitorMomentaryUnavailable"), this);
+		m_short_term = new QLabel(localized("MonitorShortTermUnavailable"), this);
+		for (QLabel *label : {m_momentary, m_short_term}) {
+			label->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
+			label->setToolTip(localized("RollingReadingsHelp"));
+		}
+		layout->addWidget(m_momentary);
+		layout->addWidget(m_short_term);
+
+		m_summary = new QLabel(localized("MonitorSummaryUnavailable"), this);
+		m_summary->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
+		layout->addWidget(m_summary);
 		m_peak_meter = new SegmentedMeter(this);
-		auto *peak_layout = qobject_cast<QVBoxLayout *>(m_peak_card->layout());
-		peak_layout->addWidget(m_peak_details);
-		peak_layout->addWidget(m_peak_meter);
-		cards->addWidget(m_gain_card, 1);
-		cards->addWidget(m_peak_card, 1);
-		layout->addLayout(cards);
+		m_peak_meter->setToolTip(localized("PeakMeterHelp"));
+		layout->addWidget(m_peak_meter);
 
+		m_latency = new QLabel(localized("MonitorLatencyUnavailable"), this);
+		m_latency->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
+		m_latency->setToolTip(localized("MonitorLatencyHelp"));
+		layout->addWidget(m_latency);
+
+		connect(m_settings, &QToolButton::clicked, this,
+			[this] { lvb_monitor_open_source_properties(m_source.instance_id); });
 		connect(m_info, &QToolButton::clicked, this, [this] { showInfo(); });
-		connect(m_source, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
-			if (index >= 0)
-				lvb_monitor_select_source(m_source->itemData(index).toUInt());
-		});
+	}
 
-		auto *timer = new QTimer(this);
-		connect(timer, &QTimer::timeout, this, [this] { refresh(); });
-		timer->start(100);
-		refresh();
+	bool matches(const lvb_monitor_source &source) const
+	{
+		return m_source.instance_id == source.instance_id && m_source.telemetry_slot == source.telemetry_slot &&
+		       std::strncmp(m_source.name, source.name, sizeof(m_source.name)) == 0;
+	}
+
+	void refresh()
+	{
+		lvb_monitor_snapshot snapshot{};
+		lvb_monitor_read_source(m_source.telemetry_slot, m_source.instance_id, &snapshot);
+		if (snapshot.stats_available && snapshot.sequence != m_last_sequence) {
+			m_last_sequence = snapshot.sequence;
+			m_last_audio_update.start();
+		}
+		const bool available = snapshot.source_available && snapshot.stats_available &&
+				       m_last_audio_update.isValid() && m_last_audio_update.elapsed() < 300;
+		const auto &stats = snapshot.stats;
+		const QString status_text = !available ? localized("MonitorWaiting")
+						       : (stats.activity_open ? localized("MonitorConnected")
+									      : localized("ActivityPaused"));
+		set_label_text(m_status, status_text);
+		const QColor status_color =
+			palette().color(available && stats.activity_open ? QPalette::Highlight : QPalette::Mid);
+		const QString status_style = QStringLiteral("font-size: 11px; color: %1;").arg(status_color.name());
+		if (m_status_dot->styleSheet() != status_style)
+			m_status_dot->setStyleSheet(status_style);
+		if (m_settings->isEnabled() != snapshot.source_available)
+			m_settings->setEnabled(snapshot.source_available);
+
+		if (!available) {
+			m_input->setReading(-120.0f, QStringLiteral("dBFS"));
+			m_output->setReading(-120.0f, QStringLiteral("dBFS"));
+			set_label_text(m_momentary, localized("MonitorMomentaryUnavailable"));
+			set_label_text(m_short_term, localized("MonitorShortTermUnavailable"));
+			set_label_text(m_summary, localized("MonitorSummaryUnavailable"));
+			m_peak_meter->setValue(-120.0f);
+			set_label_text(m_latency, localized("MonitorLatencyUnavailable"));
+			return;
+		}
+
+		m_input->setReading(stats.input_fast_rms_dbfs, QStringLiteral("dBFS"));
+		m_output->setReading(stats.output_fast_rms_dbfs, QStringLiteral("dBFS"));
+		set_label_text(m_momentary, localized("MonitorMomentaryFormat")
+						    .arg(db_text(stats.input_momentary_lufs, "LUFS"),
+							 db_text(stats.output_momentary_lufs, "LUFS")));
+		set_label_text(m_short_term, localized("MonitorShortTermFormat")
+						     .arg(db_text(stats.input_short_term_lufs, "LUFS"),
+							  db_text(stats.output_short_term_lufs, "LUFS")));
+		const QString gain = QStringLiteral("%1%2 dB")
+					     .arg(stats.gain_db > 0.05f ? QStringLiteral("+") : QString())
+					     .arg(stats.gain_db, 0, 'f', 1);
+		set_label_text(m_summary, localized("MonitorSummaryFormat")
+						  .arg(gain, db_text(stats.peak_hold_dbtp, "dBTP"),
+						       db_text(stats.peak_ceiling_dbtp, "dBTP")));
+		m_peak_meter->setValue(stats.peak_hold_dbtp, stats.peak_ceiling_dbtp);
+		if (std::isfinite(stats.sample_rate_hz) && stats.sample_rate_hz > 0.0f) {
+			const float latency_ms = lvb_output_latency_ms(stats.sample_rate_hz);
+			set_label_text(m_latency, localized("MonitorLatencyFormat")
+							  .arg(QString::number(latency_ms, 'f', 3),
+							       QString::number(LVB_TRUE_PEAK_LATENCY)));
+		} else {
+			set_label_text(m_latency, localized("MonitorLatencyUnavailable"));
+		}
+	}
+
+protected:
+	void resizeEvent(QResizeEvent *event) override
+	{
+		QFrame::resizeEvent(event);
+		if (!m_name)
+			return;
+		const QString full_name = QString::fromUtf8(m_source.name);
+		const QString elided =
+			QFontMetrics(m_name->font()).elidedText(full_name, Qt::ElideMiddle, m_name->width());
+		set_label_text(m_name, elided);
 	}
 
 private:
@@ -255,88 +323,100 @@ private:
 		box.exec();
 	}
 
-	void refresh()
-	{
-		lvb_monitor_snapshot snapshot{};
-		lvb_monitor_read(&snapshot);
-		refreshSources(snapshot);
-		const auto &stats = snapshot.stats;
-		const bool available = snapshot.stats_available;
-		m_status->setText(!available ? localized("MonitorWaiting")
-					     : (stats.activity_open ? localized("MonitorConnected")
-								    : localized("ActivityPaused")));
-		m_status_dot->setStyleSheet(
-			QStringLiteral("font-size: 11px; color: %1;")
-				.arg(palette().color(stats.activity_open ? QPalette::Highlight : QPalette::Mid).name()));
-		if (available) {
-			m_input->setReading(stats.input_momentary_lufs, stats.target_lufs, QStringLiteral("LUFS"));
-			m_output->setReading(stats.output_momentary_lufs, stats.target_lufs, QStringLiteral("LUFS"));
-			m_input_short->setText(QStringLiteral("%1  %2").arg(
-				localized("MonitorInputShort"), db_text(stats.input_short_term_lufs, "LUFS")));
-			m_output_short->setText(QStringLiteral("%1  %2").arg(
-				localized("MonitorOutputShort"), db_text(stats.output_short_term_lufs, "LUFS")));
-			m_gain_card->setValue(QStringLiteral("%1%2 dB")
-						      .arg(stats.gain_db > 0.05f ? QStringLiteral("+") : QString())
-						      .arg(stats.gain_db, 0, 'f', 1));
-			m_peak_card->setValue(db_text(stats.peak_hold_dbtp, "dBTP"));
-			m_peak_details->setText(QStringLiteral("%1 %2").arg(localized("MonitorCeiling"),
-									    db_text(stats.peak_ceiling_dbtp, "dBTP")));
-			m_peak_meter->setValue(stats.peak_hold_dbtp, stats.peak_ceiling_dbtp);
-		} else {
-			m_input->setReading(-120.0f, NAN, QStringLiteral("LUFS"));
-			m_output->setReading(-120.0f, NAN, QStringLiteral("LUFS"));
-			m_input_short->setText(QStringLiteral("%1  —").arg(localized("MonitorInputShort")));
-			m_output_short->setText(QStringLiteral("%1  —").arg(localized("MonitorOutputShort")));
-			m_gain_card->setValue(QStringLiteral("—"));
-			m_peak_card->setValue(QStringLiteral("—"));
-			m_peak_details->setText(QStringLiteral("%1 —").arg(localized("MonitorCeiling")));
-			m_peak_meter->setValue(-120.0f);
-		}
-	}
-
-	void refreshSources(const lvb_monitor_snapshot &snapshot)
-	{
-		lvb_monitor_source sources[LVB_MONITOR_MAX_SOURCES]{};
-		const size_t count = lvb_monitor_list_sources(sources, LVB_MONITOR_MAX_SOURCES);
-		m_source->setVisible(count > 1);
-		bool changed = m_source->count() != static_cast<int>(count);
-		for (size_t i = 0; !changed && i < count; i++) {
-			changed = m_source->itemData(static_cast<int>(i)).toUInt() != sources[i].instance_id ||
-				  m_source->itemText(static_cast<int>(i)) != QString::fromUtf8(sources[i].name);
-		}
-		if (changed) {
-			const QSignalBlocker blocker(m_source);
-			m_source->clear();
-			for (size_t i = 0; i < count; i++)
-				m_source->addItem(QString::fromUtf8(sources[i].name),
-						  QVariant::fromValue(sources[i].instance_id));
-		}
-		for (int i = 0; i < m_source->count(); i++) {
-			if (m_source->itemData(i).toUInt() == snapshot.source_instance_id) {
-				if (m_source->currentIndex() != i) {
-					const QSignalBlocker blocker(m_source);
-					m_source->setCurrentIndex(i);
-				}
-				break;
-			}
-		}
-	}
-
-	QLabel *m_title = nullptr;
+	lvb_monitor_source m_source{};
+	QLabel *m_name = nullptr;
 	QLabel *m_status_dot = nullptr;
 	QLabel *m_status = nullptr;
-	QLabel *m_input_short = nullptr;
-	QLabel *m_output_short = nullptr;
-	QLabel *m_peak_details = nullptr;
-	QComboBox *m_source = nullptr;
+	QLabel *m_momentary = nullptr;
+	QLabel *m_short_term = nullptr;
+	QLabel *m_summary = nullptr;
+	QLabel *m_latency = nullptr;
+	QToolButton *m_settings = nullptr;
 	QToolButton *m_info = nullptr;
 	MeterRow *m_input = nullptr;
 	MeterRow *m_output = nullptr;
 	SegmentedMeter *m_peak_meter = nullptr;
-	ValueCard *m_gain_card = nullptr;
-	ValueCard *m_peak_card = nullptr;
+	QElapsedTimer m_last_audio_update;
+	uint32_t m_last_sequence = 0;
 };
 
+class MonitorWidget final : public QWidget {
+public:
+	MonitorWidget()
+	{
+		setMinimumWidth(360);
+		setSizePolicy(QSizePolicy::Preferred, QSizePolicy::MinimumExpanding);
+		auto *layout = new QVBoxLayout(this);
+		layout->setContentsMargins(4, 4, 4, 4);
+		layout->setSpacing(0);
+
+		m_scroll = new QScrollArea(this);
+		m_scroll->setWidgetResizable(true);
+		m_scroll->setFrameShape(QFrame::NoFrame);
+		m_content = new QWidget(m_scroll);
+		m_content_layout = new QVBoxLayout(m_content);
+		m_content_layout->setContentsMargins(2, 2, 2, 2);
+		m_content_layout->setSpacing(3);
+		m_scroll->setWidget(m_content);
+		layout->addWidget(m_scroll);
+
+		auto *refresh_timer = new QTimer(this);
+		refresh_timer->setTimerType(Qt::PreciseTimer);
+		connect(refresh_timer, &QTimer::timeout, this, [this] { refresh(); });
+		refresh_timer->start(16);
+
+		auto *source_timer = new QTimer(this);
+		source_timer->setTimerType(Qt::CoarseTimer);
+		connect(source_timer, &QTimer::timeout, this, [this] { refreshSources(); });
+		source_timer->start(400);
+		refreshSources();
+	}
+
+private:
+	void refresh()
+	{
+		for (SourceMonitorWidget *source : m_source_widgets)
+			source->refresh();
+	}
+
+	void refreshSources()
+	{
+		lvb_monitor_source sources[LVB_MONITOR_MAX_SOURCES]{};
+		const size_t count = lvb_monitor_list_sources(sources, LVB_MONITOR_MAX_SOURCES);
+		bool changed = !m_sources_initialized || m_source_widgets.size() != count;
+		for (size_t i = 0; !changed && i < count; i++)
+			changed = !m_source_widgets[i]->matches(sources[i]);
+		if (!changed)
+			return;
+
+		while (QLayoutItem *item = m_content_layout->takeAt(0)) {
+			if (QWidget *widget = item->widget())
+				delete widget;
+			delete item;
+		}
+		m_source_widgets.clear();
+		if (count == 0) {
+			auto *empty = new QLabel(localized("MonitorWaiting"), m_content);
+			empty->setAlignment(Qt::AlignCenter);
+			empty->setStyleSheet(QStringLiteral("font-size: 11px;"));
+			m_content_layout->addWidget(empty);
+		} else {
+			for (size_t i = 0; i < count; i++) {
+				auto *widget = new SourceMonitorWidget(sources[i], m_content);
+				m_content_layout->addWidget(widget);
+				m_source_widgets.push_back(widget);
+			}
+			m_content_layout->addStretch(1);
+		}
+		m_sources_initialized = true;
+	}
+
+	QScrollArea *m_scroll = nullptr;
+	QWidget *m_content = nullptr;
+	QVBoxLayout *m_content_layout = nullptr;
+	std::vector<SourceMonitorWidget *> m_source_widgets;
+	bool m_sources_initialized = false;
+};
 } // namespace
 
 extern "C" void lvb_monitor_dock_load(void)

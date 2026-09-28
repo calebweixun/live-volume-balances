@@ -281,7 +281,7 @@ static int test_stereo_room_noise_uses_per_channel_activity_floor(void)
 	return 0;
 }
 
-static float run_peak_tone(float sample_rate, bool bypass, float *maximum_dbtp)
+static float run_peak_tone(float sample_rate, bool bypass, float *maximum_dbtp, float *reported_sample_rate)
 {
 	struct lvb_settings settings = test_settings();
 	settings.max_boost_db = 0.0f;
@@ -313,6 +313,8 @@ static float run_peak_tone(float sample_rate, bool bypass, float *maximum_dbtp)
 		}
 		position += frames;
 	}
+	if (reported_sample_rate)
+		*reported_sample_rate = state.stats.sample_rate_hz;
 	return maximum_sample;
 }
 
@@ -322,10 +324,17 @@ static int test_fir_peak_guard_and_meter_at_44100_and_48000(void)
 	float limited_peak_48k;
 	float bypass_peak_44k;
 	float limited_peak_44k;
-	const float bypass_sample_48k = run_peak_tone(48000.0f, true, &bypass_peak_48k);
-	const float limited_sample_48k = run_peak_tone(48000.0f, false, &limited_peak_48k);
-	const float bypass_sample_44k = run_peak_tone(44100.0f, true, &bypass_peak_44k);
-	const float limited_sample_44k = run_peak_tone(44100.0f, false, &limited_peak_44k);
+	float reported_rate_48k;
+	float reported_rate_limited_48k;
+	float reported_rate_44k;
+	float reported_rate_limited_44k;
+	const float bypass_sample_48k = run_peak_tone(48000.0f, true, &bypass_peak_48k, &reported_rate_48k);
+	const float limited_sample_48k = run_peak_tone(48000.0f, false, &limited_peak_48k, &reported_rate_limited_48k);
+	const float bypass_sample_44k = run_peak_tone(44100.0f, true, &bypass_peak_44k, &reported_rate_44k);
+	const float limited_sample_44k = run_peak_tone(44100.0f, false, &limited_peak_44k, &reported_rate_limited_44k);
+	CHECK(reported_rate_48k == 48000.0f && reported_rate_limited_48k == 48000.0f && reported_rate_44k == 44100.0f &&
+		      reported_rate_limited_44k == 44100.0f,
+	      "meter telemetry uses the actual 44.1 and 48 kHz processing rates");
 	CHECK(bypass_peak_48k > -2.6f && bypass_peak_44k > -2.6f,
 	      "4x FIR detector should report intersample peaks above the selected ceiling");
 	CHECK(limited_peak_48k <= -1.8f && limited_peak_44k <= -1.8f,
@@ -375,6 +384,114 @@ static int test_null_planes_nonfinite_samples_and_invalid_settings(void)
 	return 0;
 }
 
+static int test_fast_meter_ballistics_and_reported_sample_rate(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.bypass = true;
+	struct lvb_state state;
+	lvb_state_init(&state);
+	float samples[2400];
+	float *planes[] = {samples};
+	fill_sine(samples, 2400, 48000.0f, 900.0f, 0.25f, 0, 0.0f);
+	lvb_process(&state, &settings, 1, planes, 2400, 48000.0f);
+	CHECK(state.stats.input_fast_rms_dbfs > -18.0f && state.stats.input_fast_rms_dbfs < -14.0f,
+	      "30 ms fast meter should respond to a 50 ms signal envelope");
+	CHECK(state.stats.sample_rate_hz == 48000.0f, "live telemetry reports the active 48 kHz rate");
+	memset(samples, 0, sizeof(samples));
+	for (size_t block = 0; block < 6; block++)
+		lvb_process(&state, &settings, 1, planes, 2400, 48000.0f);
+	CHECK(state.stats.input_fast_rms_dbfs > -30.0f && state.stats.input_fast_rms_dbfs < -21.0f,
+	      "150 ms fast meter decay should fall smoothly during silence");
+	return 0;
+}
+
+static int test_expanded_control_ranges_are_effective(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.target_lufs = -6.0f;
+	settings.max_boost_db = 36.0f;
+	settings.max_reduction_db = 36.0f;
+	settings.release_ms = 50.0f;
+	settings.noise_floor_db = -100.0f;
+	settings.peak_ceiling_db = 0.0f;
+	struct lvb_state quiet_state;
+	lvb_state_init(&quiet_state);
+	process_segment(&quiet_state, &settings, 48000.0f, 900.0f, 0.015f, 48000U * 6U, 0, NULL);
+	CHECK(quiet_state.stats.target_lufs == -6.0f, "target slider lower bound is accepted by DSP");
+	CHECK(quiet_state.stats.gain_db > 20.0f, "36 dB upward-compensation range is not truncated by legacy limits");
+
+	settings.target_lufs = -36.0f;
+	settings.max_boost_db = 0.0f;
+	settings.attack_ms = 10.0f;
+	struct lvb_state loud_state;
+	lvb_state_init(&loud_state);
+	process_segment(&loud_state, &settings, 48000.0f, 900.0f, 0.80f, 48000U * 4U, 0, NULL);
+	CHECK(loud_state.stats.target_lufs == -36.0f, "target slider upper range endpoint is accepted by DSP");
+	CHECK(loud_state.stats.gain_db < -25.0f, "36 dB downward-reduction range is not truncated by legacy limits");
+
+	settings.target_lufs = -18.0f;
+	settings.max_boost_db = 36.0f;
+	settings.noise_floor_db = -100.0f;
+	struct lvb_state floor_state;
+	lvb_state_init(&floor_state);
+	process_segment(&floor_state, &settings, 48000.0f, 900.0f, 0.000025f, 48000U / 10U, 0, NULL);
+	CHECK(floor_state.stats.activity_open, "-100 dBFS activity-floor endpoint allows a very quiet signal");
+
+	settings.max_boost_db = 0.0f;
+	settings.max_reduction_db = 0.0f;
+	settings.peak_ceiling_db = -24.0f;
+	struct lvb_state ceiling_state;
+	lvb_state_init(&ceiling_state);
+	const float measured_peak =
+		process_segment(&ceiling_state, &settings, 48000.0f, 900.0f, 0.8f, 48000U, 4800U, NULL);
+	CHECK(ceiling_state.stats.peak_ceiling_dbtp == -24.0f,
+	      "-24 dBTP estimated ceiling endpoint is accepted by DSP");
+	CHECK(measured_peak < db_to_linear(-23.8f), "minimum peak-ceiling range is enforced on output samples");
+
+	struct lvb_settings attack_settings = test_settings();
+	attack_settings.target_lufs = -36.0f;
+	attack_settings.max_boost_db = 0.0f;
+	attack_settings.max_reduction_db = 36.0f;
+	attack_settings.noise_floor_db = -100.0f;
+	attack_settings.peak_ceiling_db = 0.0f;
+	attack_settings.attack_ms = 10.0f;
+	struct lvb_state fast_attack_state;
+	lvb_state_init(&fast_attack_state);
+	process_segment(&fast_attack_state, &attack_settings, 48000.0f, 900.0f, 0.8f, 480U, 0, NULL);
+	attack_settings.attack_ms = 20.0f;
+	struct lvb_state slower_attack_state;
+	lvb_state_init(&slower_attack_state);
+	process_segment(&slower_attack_state, &attack_settings, 48000.0f, 900.0f, 0.8f, 480U, 0, NULL);
+	CHECK(fast_attack_state.stats.gain_db < slower_attack_state.stats.gain_db - 1.0f,
+	      "10 ms attack endpoint responds faster than 20 ms, below the legacy 20 ms minimum");
+
+	struct lvb_settings recovery_settings = test_settings();
+	recovery_settings.max_boost_db = 18.0f;
+	recovery_settings.noise_floor_db = -100.0f;
+	recovery_settings.release_ms = 10000.0f;
+	struct lvb_state slow_recovery_state;
+	lvb_state_init(&slow_recovery_state);
+	process_segment(&slow_recovery_state, &recovery_settings, 48000.0f, 900.0f, 0.035f, 48000U * 2U, 0, NULL);
+	recovery_settings.release_ms = 5000.0f;
+	struct lvb_state faster_recovery_state;
+	lvb_state_init(&faster_recovery_state);
+	process_segment(&faster_recovery_state, &recovery_settings, 48000.0f, 900.0f, 0.035f, 48000U * 2U, 0, NULL);
+	CHECK(faster_recovery_state.stats.gain_db > slow_recovery_state.stats.gain_db + 0.6f,
+	      "10000 ms recovery endpoint is slower than 5000 ms, above the legacy 5000 ms maximum");
+	return 0;
+}
+
+static int test_plugin_latency_calculation_at_common_sample_rates(void)
+{
+	const float at_48000 = lvb_output_latency_ms(48000.0f);
+	const float at_44100 = lvb_output_latency_ms(44100.0f);
+	CHECK(fabsf(at_48000 - 0.125f) < 1e-6f, "six samples equal 0.125 ms at 48 kHz");
+	CHECK(fabsf(at_44100 - 0.13605443f) < 1e-6f, "six samples equal about 0.136 ms at 44.1 kHz");
+	CHECK(lvb_output_latency_ms(0.0f) == 0.0f && lvb_output_latency_ms(NAN) == 0.0f,
+	      "invalid sample rates have no fabricated latency value");
+	return 0;
+}
+
 int main(void)
 {
 	CHECK(test_quiet_audio_is_raised_with_linked_stereo_and_live_meters() == 0, "quiet lift, linkage and meters");
@@ -390,6 +507,10 @@ int main(void)
 	CHECK(test_meter_windows_and_bypass_latency() == 0, "rolling meters and fixed bypass latency");
 	CHECK(test_null_planes_nonfinite_samples_and_invalid_settings() == 0,
 	      "null planes, non-finite samples and invalid settings");
+	CHECK(test_fast_meter_ballistics_and_reported_sample_rate() == 0, "fast meter and sample-rate telemetry");
+	CHECK(test_expanded_control_ranges_are_effective() == 0, "expanded DSP control ranges");
+	CHECK(test_plugin_latency_calculation_at_common_sample_rates() == 0,
+	      "plugin input-to-output latency at 44.1 and 48 kHz");
 	puts("All leveler DSP tests passed.");
 	return 0;
 }
