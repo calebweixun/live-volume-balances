@@ -382,7 +382,7 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	 * react. The envelope is updated sample-wise, while this target is refreshed
 	 * per OBS block to avoid a logarithm in the audio hot loop.
 	 */
-	const float sustained_input_peak_db = linear_to_db(state->input_peak_envelope);
+	const float sustained_input_peak_db = (float)linear_to_db(state->input_peak_envelope);
 	const float peak_aware_target_db =
 		fminf(requested_gain_db, peak_ceiling_db - sustained_input_peak_db - LVB_PEAK_RIDER_HEADROOM_DB);
 	const float smoothness_ratio = fader_smoothness / 100.0f;
