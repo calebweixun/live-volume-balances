@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <obs-frontend-api.h>
 #include <obs-module.h>
 #include <media-io/audio-io.h>
 
@@ -20,6 +21,7 @@
 
 #include "leveler-dsp.h"
 #include "monitor-bridge.h"
+#include "monitor-telemetry.h"
 
 #ifdef _MSC_VER
 typedef volatile LONG lvb_atomic_uint32_t;
@@ -43,7 +45,7 @@ static pthread_mutex_t instances_lock = PTHREAD_MUTEX_INITIALIZER;
 #define SETTING_CEILING "peak_ceiling_db"
 #define SETTING_SCHEMA_VERSION "settings_schema_version"
 
-#define LVB_MAX_FILTER_INSTANCES 64
+#define LVB_MAX_FILTER_INSTANCES LVB_MONITOR_MAX_SOURCES
 
 struct leveler_filter_data {
 	struct lvb_state state;
@@ -55,20 +57,17 @@ struct leveler_filter_data {
 	lvb_atomic_uint32_t release_ms;
 	lvb_atomic_uint32_t noise_floor_db;
 	lvb_atomic_uint32_t peak_ceiling_db;
-	obs_source_t *source;
+	obs_source_t *filter_source;
+	char parent_source_name[LVB_MONITOR_SOURCE_NAME_LENGTH];
 	uint32_t instance_id;
+	size_t telemetry_slot;
 	size_t channels;
 	float sample_rate;
 };
 
 static struct leveler_filter_data *filter_instances[LVB_MAX_FILTER_INSTANCES];
 static uint32_t next_instance_id = 1;
-static lvb_atomic_uint32_t selected_instance_id;
-static lvb_atomic_uint32_t published_instance_id;
-/* Audio callbacks try this once; UI readers copy a complete snapshot under it. */
-static lvb_atomic_uint32_t published_snapshot_lock;
-static lvb_atomic_uint32_t published_stats[9];
-static lvb_atomic_uint32_t published_flags;
+static bool telemetry_initialized;
 
 #ifdef _MSC_VER
 static void lvb_atomic_init(lvb_atomic_uint32_t *value, uint32_t initial)
@@ -86,21 +85,6 @@ static uint32_t lvb_atomic_load(const lvb_atomic_uint32_t *value)
 	return (uint32_t)InterlockedCompareExchange((volatile LONG *)value, 0, 0);
 }
 
-static bool lvb_atomic_set_if_zero(lvb_atomic_uint32_t *value)
-{
-	return InterlockedCompareExchange(value, 1, 0) == 0;
-}
-
-static void lvb_atomic_wait_lock(lvb_atomic_uint32_t *value)
-{
-	while (!lvb_atomic_set_if_zero(value))
-		YieldProcessor();
-}
-
-static void lvb_atomic_release_lock(lvb_atomic_uint32_t *value)
-{
-	InterlockedExchange(value, 0);
-}
 #else
 static void lvb_atomic_init(lvb_atomic_uint32_t *value, uint32_t initial)
 {
@@ -117,23 +101,6 @@ static uint32_t lvb_atomic_load(const lvb_atomic_uint32_t *value)
 	return atomic_load_explicit(value, memory_order_acquire);
 }
 
-static bool lvb_atomic_set_if_zero(lvb_atomic_uint32_t *value)
-{
-	uint32_t expected = 0U;
-	return atomic_compare_exchange_strong_explicit(value, &expected, 1U, memory_order_acquire,
-						       memory_order_relaxed);
-}
-
-static void lvb_atomic_wait_lock(lvb_atomic_uint32_t *value)
-{
-	while (!lvb_atomic_set_if_zero(value))
-		atomic_signal_fence(memory_order_acq_rel);
-}
-
-static void lvb_atomic_release_lock(lvb_atomic_uint32_t *value)
-{
-	atomic_store_explicit(value, 0U, memory_order_release);
-}
 #endif
 
 static uint32_t float_bits(float value)
@@ -150,49 +117,28 @@ static float bits_float(uint32_t bits)
 	return value;
 }
 
-struct lvb_published_snapshot {
-	uint32_t instance_id;
-	uint32_t flags;
-	uint32_t stats[9];
-};
-
-static void read_published_snapshot(struct lvb_published_snapshot *snapshot)
+static bool leveler_register_instance(struct leveler_filter_data *filter)
 {
-	lvb_atomic_wait_lock(&published_snapshot_lock);
-	snapshot->instance_id = lvb_atomic_load(&published_instance_id);
-	snapshot->flags = lvb_atomic_load(&published_flags);
-	for (size_t i = 0; i < 9; i++)
-		snapshot->stats[i] = lvb_atomic_load(&published_stats[i]);
-	lvb_atomic_release_lock(&published_snapshot_lock);
-}
-
-static void clear_published_snapshot(void)
-{
-	lvb_atomic_wait_lock(&published_snapshot_lock);
-	lvb_atomic_store(&published_instance_id, 0U);
-	lvb_atomic_store(&published_flags, 0U);
-	for (size_t i = 0; i < 9; i++)
-		lvb_atomic_store(&published_stats[i], float_bits(-120.0f));
-	lvb_atomic_release_lock(&published_snapshot_lock);
-}
-
-static void leveler_register_instance(struct leveler_filter_data *filter)
-{
+	bool registered = false;
 	INSTANCES_LOCK();
+	if (!telemetry_initialized) {
+		lvb_telemetry_init();
+		telemetry_initialized = true;
+	}
 	for (size_t i = 0; i < LVB_MAX_FILTER_INSTANCES; i++) {
 		if (!filter_instances[i]) {
 			filter->instance_id = next_instance_id++;
 			if (next_instance_id == 0)
 				next_instance_id = 1;
+			filter->telemetry_slot = i;
+			lvb_telemetry_register_slot(i, filter->instance_id);
 			filter_instances[i] = filter;
-			if (lvb_atomic_load(&selected_instance_id) == 0U) {
-				lvb_atomic_store(&selected_instance_id, filter->instance_id);
-				clear_published_snapshot();
-			}
+			registered = true;
 			break;
 		}
 	}
 	INSTANCES_UNLOCK();
+	return registered;
 }
 
 static void leveler_unregister_instance(struct leveler_filter_data *filter)
@@ -201,18 +147,9 @@ static void leveler_unregister_instance(struct leveler_filter_data *filter)
 	for (size_t i = 0; i < LVB_MAX_FILTER_INSTANCES; i++) {
 		if (filter_instances[i] == filter) {
 			filter_instances[i] = NULL;
+			lvb_telemetry_unregister_slot(filter->telemetry_slot, filter->instance_id);
 			break;
 		}
-	}
-	if (lvb_atomic_load(&selected_instance_id) == filter->instance_id) {
-		lvb_atomic_store(&selected_instance_id, 0U);
-		for (size_t i = 0; i < LVB_MAX_FILTER_INSTANCES; i++) {
-			if (filter_instances[i]) {
-				lvb_atomic_store(&selected_instance_id, filter_instances[i]->instance_id);
-				break;
-			}
-		}
-		clear_published_snapshot();
 	}
 	INSTANCES_UNLOCK();
 }
@@ -231,30 +168,6 @@ static struct lvb_settings leveler_settings_snapshot(const struct leveler_filter
 	};
 }
 
-static void publish_stats(uint32_t instance_id, const struct lvb_stats *stats)
-{
-	if (instance_id != lvb_atomic_load(&selected_instance_id) || !lvb_atomic_set_if_zero(&published_snapshot_lock))
-		return;
-	if (instance_id != lvb_atomic_load(&selected_instance_id)) {
-		lvb_atomic_release_lock(&published_snapshot_lock);
-		return;
-	}
-	lvb_atomic_store(&published_instance_id, 0U);
-	lvb_atomic_store(&published_stats[0], float_bits(stats->input_momentary_lufs));
-	lvb_atomic_store(&published_stats[1], float_bits(stats->input_short_term_lufs));
-	lvb_atomic_store(&published_stats[2], float_bits(stats->output_momentary_lufs));
-	lvb_atomic_store(&published_stats[3], float_bits(stats->output_short_term_lufs));
-	lvb_atomic_store(&published_stats[4], float_bits(stats->true_peak_dbtp));
-	lvb_atomic_store(&published_stats[5], float_bits(stats->peak_hold_dbtp));
-	lvb_atomic_store(&published_stats[6], float_bits(stats->gain_db));
-	lvb_atomic_store(&published_stats[7], float_bits(stats->target_lufs));
-	lvb_atomic_store(&published_stats[8], float_bits(stats->peak_ceiling_dbtp));
-	lvb_atomic_store(&published_flags, stats->activity_open ? 1U : 0U);
-	if (instance_id == lvb_atomic_load(&selected_instance_id))
-		lvb_atomic_store(&published_instance_id, instance_id);
-	lvb_atomic_release_lock(&published_snapshot_lock);
-}
-
 size_t lvb_monitor_list_sources(struct lvb_monitor_source *sources, size_t capacity)
 {
 	size_t count = 0;
@@ -265,12 +178,13 @@ size_t lvb_monitor_list_sources(struct lvb_monitor_source *sources, size_t capac
 			continue;
 		if (sources && count < capacity) {
 			sources[count].instance_id = filter->instance_id;
-			const char *name = filter->source ? obs_source_get_name(filter->source) : NULL;
-			if (name && name[0] != '\0')
-				snprintf(sources[count].name, sizeof(sources[count].name), "%s (#%u)", name,
+			sources[count].telemetry_slot = filter->telemetry_slot;
+			const char *name = filter->parent_source_name;
+			if (name[0] != '\0')
+				snprintf(sources[count].name, sizeof(sources[count].name), "%.113s (#%u)", name,
 					 filter->instance_id);
 			else
-				snprintf(sources[count].name, sizeof(sources[count].name), "Audio source %u",
+				snprintf(sources[count].name, sizeof(sources[count].name), "Audio source #%u",
 					 filter->instance_id);
 		}
 		count++;
@@ -279,52 +193,37 @@ size_t lvb_monitor_list_sources(struct lvb_monitor_source *sources, size_t capac
 	return count < capacity ? count : capacity;
 }
 
-void lvb_monitor_select_source(uint32_t instance_id)
-{
-	bool found = false;
-	INSTANCES_LOCK();
-	for (size_t i = 0; i < LVB_MAX_FILTER_INSTANCES; i++) {
-		if (filter_instances[i] && filter_instances[i]->instance_id == instance_id) {
-			found = true;
-			break;
-		}
-	}
-	if (found && instance_id != lvb_atomic_load(&selected_instance_id)) {
-		lvb_atomic_store(&selected_instance_id, instance_id);
-		clear_published_snapshot();
-	}
-	INSTANCES_UNLOCK();
-}
-
-void lvb_monitor_read(struct lvb_monitor_snapshot *snapshot)
+void lvb_monitor_read_source(size_t telemetry_slot, uint32_t instance_id, struct lvb_monitor_snapshot *snapshot)
 {
 	if (!snapshot)
 		return;
 	memset(snapshot, 0, sizeof(*snapshot));
-	struct lvb_published_snapshot published;
-	read_published_snapshot(&published);
-	snapshot->source_instance_id = lvb_atomic_load(&selected_instance_id);
+	snapshot->source_instance_id = instance_id;
+	struct lvb_telemetry_snapshot telemetry;
+	if (!lvb_telemetry_read(telemetry_slot, instance_id, &telemetry))
+		return;
+	snapshot->source_available = telemetry.available;
+	snapshot->stats_available = telemetry.stats_available;
+	snapshot->sequence = telemetry.sequence;
+	snapshot->stats = telemetry.stats;
+}
+
+bool lvb_monitor_open_source_properties(uint32_t instance_id)
+{
+	obs_source_t *filter_source = NULL;
 	INSTANCES_LOCK();
 	for (size_t i = 0; i < LVB_MAX_FILTER_INSTANCES; i++) {
-		if (filter_instances[i] && filter_instances[i]->instance_id == snapshot->source_instance_id) {
-			snapshot->source_available = true;
+		if (filter_instances[i] && filter_instances[i]->instance_id == instance_id) {
+			filter_source = obs_source_get_ref(filter_instances[i]->filter_source);
 			break;
 		}
 	}
 	INSTANCES_UNLOCK();
-	snapshot->stats_available = snapshot->source_available && published.instance_id == snapshot->source_instance_id;
-	if (!snapshot->stats_available)
-		return;
-	snapshot->stats.input_momentary_lufs = bits_float(published.stats[0]);
-	snapshot->stats.input_short_term_lufs = bits_float(published.stats[1]);
-	snapshot->stats.output_momentary_lufs = bits_float(published.stats[2]);
-	snapshot->stats.output_short_term_lufs = bits_float(published.stats[3]);
-	snapshot->stats.true_peak_dbtp = bits_float(published.stats[4]);
-	snapshot->stats.peak_hold_dbtp = bits_float(published.stats[5]);
-	snapshot->stats.gain_db = bits_float(published.stats[6]);
-	snapshot->stats.target_lufs = bits_float(published.stats[7]);
-	snapshot->stats.peak_ceiling_dbtp = bits_float(published.stats[8]);
-	snapshot->stats.activity_open = (published.flags & 1U) != 0;
+	if (!filter_source)
+		return false;
+	obs_frontend_open_source_properties(filter_source);
+	obs_source_release(filter_source);
+	return true;
 }
 
 static const char *leveler_name(void *unused)
@@ -405,7 +304,7 @@ static void *leveler_create(obs_data_t *settings, obs_source_t *source)
 	lvb_atomic_init(&filter->release_ms, float_bits(1800.0f));
 	lvb_atomic_init(&filter->noise_floor_db, float_bits(-46.0f));
 	lvb_atomic_init(&filter->peak_ceiling_db, float_bits(-1.0f));
-	filter->source = source;
+	filter->filter_source = source;
 	audio_t *audio = obs_get_audio();
 	if (audio) {
 		filter->channels = audio_output_get_channels(audio);
@@ -413,9 +312,25 @@ static void *leveler_create(obs_data_t *settings, obs_source_t *source)
 	}
 	if (filter->channels > LVB_MAX_CHANNELS || filter->channels > MAX_AV_PLANES)
 		filter->channels = LVB_MAX_CHANNELS < MAX_AV_PLANES ? LVB_MAX_CHANNELS : MAX_AV_PLANES;
-	leveler_register_instance(filter);
+	if (!leveler_register_instance(filter)) {
+		bfree(filter);
+		return NULL;
+	}
 	leveler_update(filter, settings);
 	return filter;
+}
+
+static void leveler_filter_add(void *opaque, obs_source_t *source)
+{
+	struct leveler_filter_data *filter = opaque;
+	if (!filter || !source)
+		return;
+	const char *name = obs_source_get_name(source);
+	if (!name || name[0] == '\0')
+		return;
+	INSTANCES_LOCK();
+	snprintf(filter->parent_source_name, sizeof(filter->parent_source_name), "%s", name);
+	INSTANCES_UNLOCK();
 }
 
 static void leveler_destroy(void *opaque)
@@ -443,7 +358,7 @@ static struct obs_audio_data *leveler_filter_audio(void *opaque, struct obs_audi
 	lvb_process(&filter->state, &settings, filter->channels, planes, audio->frames, filter->sample_rate);
 	struct lvb_stats stats;
 	lvb_get_stats(&filter->state, &stats);
-	publish_stats(filter->instance_id, &stats);
+	lvb_telemetry_publish(filter->telemetry_slot, filter->instance_id, &stats);
 	return audio;
 }
 
@@ -453,10 +368,10 @@ static obs_properties_t *leveler_properties(void *data)
 	obs_properties_t *properties = obs_properties_create();
 	obs_property_t *property;
 	property = obs_properties_add_float_slider(properties, SETTING_TARGET_LUFS, obs_module_text("TargetLoudness"),
-						   -30.0, -9.0, 0.5);
+						   -36.0, -6.0, 0.5);
 	obs_property_float_set_suffix(property, " LUFS");
 	set_property_help(property, "TargetLoudnessHelp");
-	property = obs_properties_add_float_slider(properties, SETTING_CEILING, obs_module_text("PeakCeiling"), -12.0,
+	property = obs_properties_add_float_slider(properties, SETTING_CEILING, obs_module_text("PeakCeiling"), -24.0,
 						   0.0, 0.1);
 	obs_property_float_set_suffix(property, " dBTP est.");
 	set_property_help(property, "PeakCeilingHelp");
@@ -465,21 +380,21 @@ static obs_properties_t *leveler_properties(void *data)
 
 	obs_properties_t *advanced = obs_properties_create();
 	property = obs_properties_add_float_slider(advanced, SETTING_MAX_BOOST, obs_module_text("MaximumCompensation"),
-						   0.0, 18.0, 0.5);
+						   0.0, 36.0, 0.5);
 	obs_property_float_set_suffix(property, " dB");
 	set_property_help(property, "MaximumCompensationHelp");
 	property = obs_properties_add_float_slider(advanced, SETTING_MAX_REDUCTION, obs_module_text("MaximumReduction"),
-						   0.0, 24.0, 0.5);
+						   0.0, 36.0, 0.5);
 	obs_property_float_set_suffix(property, " dB");
 	set_property_help(property, "MaximumReductionHelp");
 	property = obs_properties_add_float_slider(advanced, SETTING_NOISE_FLOOR, obs_module_text("ActivityFloor"),
-						   -80.0, -24.0, 1.0);
+						   -100.0, -6.0, 1.0);
 	obs_property_float_set_suffix(property, " dBFS");
 	set_property_help(property, "ActivityFloorHelp");
-	property = obs_properties_add_int_slider(advanced, SETTING_ATTACK, obs_module_text("GainAttack"), 20, 1000, 10);
+	property = obs_properties_add_int_slider(advanced, SETTING_ATTACK, obs_module_text("GainAttack"), 10, 3000, 10);
 	obs_property_int_set_suffix(property, " ms");
 	set_property_help(property, "GainAttackHelp");
-	property = obs_properties_add_int_slider(advanced, SETTING_RELEASE, obs_module_text("GainRecovery"), 100, 5000,
+	property = obs_properties_add_int_slider(advanced, SETTING_RELEASE, obs_module_text("GainRecovery"), 50, 10000,
 						 50);
 	obs_property_int_set_suffix(property, " ms");
 	set_property_help(property, "GainRecoveryHelp");
@@ -494,6 +409,7 @@ struct obs_source_info live_volume_balancer_filter = {
 	.get_name = leveler_name,
 	.create = leveler_create,
 	.destroy = leveler_destroy,
+	.filter_add = leveler_filter_add,
 	.update = leveler_update,
 	.filter_audio = leveler_filter_audio,
 	.get_defaults = leveler_defaults,

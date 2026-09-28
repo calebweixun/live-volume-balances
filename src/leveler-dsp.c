@@ -12,6 +12,8 @@
 #define LVB_PI 3.14159265358979323846
 #define LVB_LUFS_OFFSET (-0.691)
 #define LVB_BUCKET_SECONDS 0.01
+#define LVB_FAST_METER_ATTACK_SECONDS 0.030
+#define LVB_FAST_METER_RELEASE_SECONDS 0.150
 #define LVB_ACTIVITY_HOLD_SECONDS 0.25f
 #define LVB_ACTIVITY_RELATIVE_DB 12.0f
 
@@ -98,7 +100,18 @@ static void configure_k_weighting(struct lvb_state *state, float sample_rate)
 	state->sample_rate = sample_rate;
 	state->activity_energy_coefficient = (float)(1.0 - exp(-1.0 / (0.005 * frequency)));
 	state->activity_gain_coefficient = (float)exp(-1.0 / (0.025 * frequency));
+	state->fast_meter_attack_coefficient = (float)exp(-1.0 / (LVB_FAST_METER_ATTACK_SECONDS * frequency));
+	state->fast_meter_release_coefficient = (float)exp(-1.0 / (LVB_FAST_METER_RELEASE_SECONDS * frequency));
+	state->input_fast_meter_energy = 0.0;
+	state->output_fast_meter_energy = 0.0;
 	state->bucket_frames = (uint32_t)fmax(1.0, floor(frequency * LVB_BUCKET_SECONDS + 0.5));
+}
+
+static double update_fast_meter_energy(double previous, double input, float attack_coefficient,
+				       float release_coefficient)
+{
+	const float coefficient = input > previous ? attack_coefficient : release_coefficient;
+	return input + coefficient * (previous - input);
 }
 
 static double process_biquad(double input, const double b[3], const double a[2], struct lvb_biquad_state *state)
@@ -248,11 +261,20 @@ void lvb_state_init(struct lvb_state *state)
 	state->activity_reference_dbfs = -120.0f;
 	state->stats.input_momentary_lufs = -120.0f;
 	state->stats.input_short_term_lufs = -120.0f;
+	state->stats.input_fast_rms_dbfs = -120.0f;
+	state->stats.output_fast_rms_dbfs = -120.0f;
 	state->stats.output_momentary_lufs = -120.0f;
 	state->stats.output_short_term_lufs = -120.0f;
 	state->stats.true_peak_dbtp = -120.0f;
 	state->stats.peak_hold_dbtp = -120.0f;
 	state->peak_hold_dbtp = -120.0f;
+}
+
+float lvb_output_latency_ms(float sample_rate)
+{
+	if (!isfinite(sample_rate) || sample_rate <= 0.0f)
+		return 0.0f;
+	return (float)LVB_TRUE_PEAK_LATENCY * 1000.0f / sample_rate;
 }
 
 void lvb_get_stats(const struct lvb_state *state, struct lvb_stats *stats)
@@ -272,13 +294,13 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	if (fabsf(state->sample_rate - sample_rate) > 0.5f)
 		configure_k_weighting(state, sample_rate);
 
-	const float target_lufs = clampf(settings->target_lufs, -30.0f, -9.0f);
-	const float max_boost_db = clampf(settings->max_boost_db, 0.0f, 18.0f);
-	const float max_reduction_db = clampf(settings->max_reduction_db, 0.0f, 24.0f);
-	const float attack_ms = clampf(settings->attack_ms, 20.0f, 1000.0f);
-	const float release_ms = clampf(settings->release_ms, 100.0f, 5000.0f);
-	const float noise_floor_db = clampf(settings->noise_floor_db, -80.0f, -24.0f);
-	const float peak_ceiling_db = clampf(settings->peak_ceiling_db, -12.0f, 0.0f);
+	const float target_lufs = clampf(settings->target_lufs, -36.0f, -6.0f);
+	const float max_boost_db = clampf(settings->max_boost_db, 0.0f, 36.0f);
+	const float max_reduction_db = clampf(settings->max_reduction_db, 0.0f, 36.0f);
+	const float attack_ms = clampf(settings->attack_ms, 10.0f, 3000.0f);
+	const float release_ms = clampf(settings->release_ms, 50.0f, 10000.0f);
+	const float noise_floor_db = clampf(settings->noise_floor_db, -100.0f, -6.0f);
+	const float peak_ceiling_db = clampf(settings->peak_ceiling_db, -24.0f, 0.0f);
 	const float peak_ceiling = db_to_linear(peak_ceiling_db);
 
 	/* Sense the current block without modifying it. */
@@ -305,9 +327,14 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 			frame_activity_energy /= (double)activity_channels;
 		state->activity_energy +=
 			state->activity_energy_coefficient * (frame_activity_energy - state->activity_energy);
+		state->input_fast_meter_energy = update_fast_meter_energy(state->input_fast_meter_energy,
+									  frame_activity_energy,
+									  state->fast_meter_attack_coefficient,
+									  state->fast_meter_release_coefficient);
 		meter_add_frame(&state->input_meter, frame_energy, state->bucket_frames);
 	}
 
+	const float input_fast_rms_dbfs = energy_to_dbfs(state->input_fast_meter_energy);
 	const float input_momentary_lufs = meter_momentary_lufs(&state->input_meter);
 	const float input_short_term_lufs = meter_short_term_lufs(&state->input_meter);
 	const float block_seconds = (float)((double)frames / sample_rate);
@@ -364,6 +391,8 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 		last_applied_gain = applied_gain;
 		float output_values[LVB_MAX_CHANNELS] = {0};
 		double frame_output_energy = 0.0;
+		double frame_output_fast_energy = 0.0;
+		size_t output_fast_channels = 0;
 		for (size_t channel = 0; channel < channels; channel++) {
 			float *samples = audio[channel];
 			const float input = input_values[channel];
@@ -384,7 +413,17 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 			const double filtered = process_biquad(shelf, state->highpass_b, state->highpass_a,
 							       &state->output_k_highpass[channel]);
 			frame_output_energy += weight * filtered * filtered;
+			if (weight > 0.0) {
+				frame_output_fast_energy += (double)output * output;
+				output_fast_channels++;
+			}
 		}
+		if (output_fast_channels > 0)
+			frame_output_fast_energy /= (double)output_fast_channels;
+		state->output_fast_meter_energy = update_fast_meter_energy(state->output_fast_meter_energy,
+									   frame_output_fast_energy,
+									   state->fast_meter_attack_coefficient,
+									   state->fast_meter_release_coefficient);
 		meter_add_frame(&state->output_meter, frame_output_energy, state->bucket_frames);
 		if (state->true_peak_delay_frames < LVB_TRUE_PEAK_LATENCY)
 			state->true_peak_delay_frames++;
@@ -397,11 +436,14 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 
 	state->stats.input_momentary_lufs = input_momentary_lufs;
 	state->stats.input_short_term_lufs = input_short_term_lufs;
+	state->stats.input_fast_rms_dbfs = input_fast_rms_dbfs;
+	state->stats.output_fast_rms_dbfs = energy_to_dbfs(state->output_fast_meter_energy);
 	state->stats.output_momentary_lufs = meter_momentary_lufs(&state->output_meter);
 	state->stats.output_short_term_lufs = meter_short_term_lufs(&state->output_meter);
 	state->stats.true_peak_dbtp = linear_to_db(maximum_output_peak);
 	state->stats.target_lufs = target_lufs;
 	state->stats.peak_ceiling_dbtp = peak_ceiling_db;
+	state->stats.sample_rate_hz = sample_rate;
 	if (state->stats.true_peak_dbtp >= state->peak_hold_dbtp) {
 		state->peak_hold_dbtp = state->stats.true_peak_dbtp;
 		state->peak_hold_seconds = 1.5f;

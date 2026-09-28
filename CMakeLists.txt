@@ -45,7 +45,7 @@ find_package(Threads REQUIRED)
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c src/leveler-filter.c src/leveler-dsp.c src/monitor-dock.cpp
+  PRIVATE src/plugin-main.c src/leveler-filter.c src/leveler-dsp.c src/monitor-telemetry.c src/monitor-dock.cpp
 )
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE c_std_11)
 target_compile_features(${CMAKE_PROJECT_NAME} PRIVATE cxx_std_17)
@@ -64,4 +64,9 @@ if(BUILD_TESTING)
     target_link_libraries(leveler-dsp-test PRIVATE m)
   endif()
   add_test(NAME leveler-dsp COMMAND leveler-dsp-test)
+
+  add_executable(monitor-telemetry-test tests/monitor-telemetry-test.c src/monitor-telemetry.c)
+  target_include_directories(monitor-telemetry-test PRIVATE src)
+  target_compile_features(monitor-telemetry-test PRIVATE c_std_11)
+  add_test(NAME monitor-telemetry COMMAND monitor-telemetry-test)
 endif()
