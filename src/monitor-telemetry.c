@@ -16,7 +16,7 @@ typedef volatile LONG lvb_atomic_uint32_t;
 typedef _Atomic(uint32_t) lvb_atomic_uint32_t;
 #endif
 
-#define LVB_TELEMETRY_STATS_COUNT 12
+#define LVB_TELEMETRY_STATS_COUNT 17
 
 struct lvb_telemetry_slot {
 	lvb_atomic_uint32_t owner_id;
@@ -181,10 +181,16 @@ bool lvb_telemetry_publish(size_t slot_index, uint32_t instance_id, const struct
 		stats->input_fast_rms_dbfs,
 		stats->output_fast_rms_dbfs,
 		stats->sample_rate_hz,
+		stats->max_boost_db,
+		stats->max_reduction_db,
+		stats->noise_floor_dbfs,
+		stats->attack_ms,
+		stats->recovery_ms,
 	};
 	for (size_t i = 0; i < LVB_TELEMETRY_STATS_COUNT; i++)
 		atomic_store_u32(&slot->stats[i], float_bits(values[i]));
-	atomic_store_u32(&slot->flags, stats->activity_open ? 1U : 0U);
+	const uint32_t flags = (stats->activity_open ? 1U : 0U) | (stats->bypass ? 2U : 0U);
+	atomic_store_u32(&slot->flags, flags);
 	uint32_t sequence = atomic_load_u32(&slot->sequence) + 1U;
 	if (sequence == 0U)
 		sequence = 1U;
@@ -226,10 +232,17 @@ bool lvb_telemetry_read(size_t slot_index, uint32_t instance_id, struct lvb_tele
 		&snapshot->stats.input_fast_rms_dbfs,
 		&snapshot->stats.output_fast_rms_dbfs,
 		&snapshot->stats.sample_rate_hz,
+		&snapshot->stats.max_boost_db,
+		&snapshot->stats.max_reduction_db,
+		&snapshot->stats.noise_floor_dbfs,
+		&snapshot->stats.attack_ms,
+		&snapshot->stats.recovery_ms,
 	};
 	for (size_t i = 0; i < LVB_TELEMETRY_STATS_COUNT; i++)
 		*values[i] = bits_float(atomic_load_u32(&slot->stats[i]));
-	snapshot->stats.activity_open = (atomic_load_u32(&slot->flags) & 1U) != 0U;
+	const uint32_t flags = atomic_load_u32(&slot->flags);
+	snapshot->stats.activity_open = (flags & 1U) != 0U;
+	snapshot->stats.bypass = (flags & 2U) != 0U;
 	atomic_release_lock(&slot->lock);
 	return true;
 }

@@ -38,6 +38,7 @@
 namespace {
 
 constexpr auto DockId = "live_volume_balancer_monitor";
+constexpr int MeterLabelWidth = 132;
 
 QString localized(const char *key)
 {
@@ -80,6 +81,25 @@ public:
 		update();
 	}
 
+	void setBypassed(bool bypassed)
+	{
+		if (m_bypassed == bypassed)
+			return;
+		m_bypassed = bypassed;
+		update();
+	}
+
+	void setScale(float minimum_db, float maximum_db)
+	{
+		if (!std::isfinite(minimum_db) || !std::isfinite(maximum_db) || maximum_db <= minimum_db)
+			return;
+		if (std::fabs(minimum_db - m_minimum_db) < 0.01f && std::fabs(maximum_db - m_maximum_db) < 0.01f)
+			return;
+		m_minimum_db = minimum_db;
+		m_maximum_db = maximum_db;
+		update();
+	}
+
 protected:
 	void paintEvent(QPaintEvent *event) override
 	{
@@ -96,7 +116,8 @@ protected:
 		const QRectF inner = bounds.adjusted(2.0, 2.0, -2.0, -2.0);
 		if (inner.width() <= 0.0)
 			return;
-		const double fraction = std::clamp((static_cast<double>(m_value) + 60.0) / 60.0, 0.0, 1.0);
+		const double range = static_cast<double>(m_maximum_db - m_minimum_db);
+		const double fraction = std::clamp((static_cast<double>(m_value) - m_minimum_db) / range, 0.0, 1.0);
 		const double starts[] = {0.0, 0.66, 0.88};
 		const double ends[] = {0.66, 0.88, 1.0};
 		const QColor colors[] = {QColor(65, 184, 112), QColor(224, 177, 63), QColor(218, 83, 77)};
@@ -116,11 +137,22 @@ protected:
 			}
 		}
 
+		QColor tick_color = palette().color(QPalette::WindowText);
+		tick_color.setAlpha(96);
+		painter.setPen(QPen(tick_color, 1.0));
+		for (int tick = 1; tick < 4; tick++) {
+			const double x = inner.left() + static_cast<double>(tick) * inner.width() / 4.0;
+			painter.drawLine(QPointF(x, inner.top()), QPointF(x, inner.bottom()));
+		}
+
 		if (std::isfinite(m_marker)) {
 			const double marker_fraction =
-				std::clamp((static_cast<double>(m_marker) + 60.0) / 60.0, 0.0, 1.0);
+				std::clamp((static_cast<double>(m_marker) - m_minimum_db) / range, 0.0, 1.0);
 			const double x = inner.left() + marker_fraction * inner.width();
-			painter.setPen(QPen(palette().color(QPalette::WindowText), 1.5));
+			QColor marker_color = palette().color(QPalette::WindowText);
+			if (m_bypassed)
+				marker_color.setAlpha(88);
+			painter.setPen(QPen(marker_color, 1.5));
 			painter.drawLine(QPointF(x, inner.top() - 1.0), QPointF(x, inner.bottom() + 1.0));
 		}
 	}
@@ -128,40 +160,141 @@ protected:
 private:
 	float m_value = -120.0f;
 	float m_marker = NAN;
+	float m_minimum_db = -60.0f;
+	float m_maximum_db = 0.0f;
+	bool m_bypassed = false;
 };
 
 class MeterRow final : public QWidget {
 public:
-	explicit MeterRow(const QString &title, QWidget *parent = nullptr) : QWidget(parent)
+	explicit MeterRow(const QString &title, float minimum_db, float maximum_db, const char *help_key,
+			  const char *marker_format_key = nullptr, QWidget *parent = nullptr)
+		: QWidget(parent),
+		  m_marker_format_key(marker_format_key)
 	{
 		auto *layout = new QHBoxLayout(this);
 		layout->setContentsMargins(0, 0, 0, 0);
 		layout->setSpacing(5);
+		auto *labels = new QVBoxLayout();
+		labels->setContentsMargins(0, 0, 0, 0);
+		labels->setSpacing(0);
 		m_title = new QLabel(title, this);
-		m_title->setMinimumWidth(62);
-		m_title->setMaximumWidth(72);
+		m_title->setFixedWidth(MeterLabelWidth);
 		m_title->setStyleSheet(QStringLiteral("font-size: 11px; font-weight: 600;"));
+		labels->addWidget(m_title);
+		if (marker_format_key) {
+			m_marker_value = new QLabel(QStringLiteral("—"), this);
+			m_marker_value->setStyleSheet(QStringLiteral("font-size: 10px;"));
+			m_marker_value->setToolTip(localized(help_key));
+			labels->addWidget(m_marker_value);
+		}
 		m_meter = new SegmentedMeter(this);
-		m_meter->setToolTip(localized("FastMeterHelp"));
+		m_meter->setScale(minimum_db, maximum_db);
+		m_meter->setToolTip(localized(help_key));
 		m_value = new QLabel(QStringLiteral("—"), this);
 		m_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 		m_value->setMinimumWidth(76);
-		m_value->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
-		layout->addWidget(m_title);
+		m_value->setStyleSheet(QStringLiteral("font-size: 11px;"));
+		layout->addLayout(labels);
 		layout->addWidget(m_meter, 1);
 		layout->addWidget(m_value);
 	}
 
-	void setReading(float value, const QString &suffix)
+	void setReading(float value, const QString &suffix, float marker = NAN)
 	{
-		m_meter->setValue(value);
+		m_meter->setValue(value, marker);
 		set_label_text(m_value, db_text(value, suffix.toUtf8().constData()));
+		if (m_marker_value)
+			set_label_text(
+				m_marker_value,
+				localized(m_marker_format_key).arg(db_text(marker, suffix.toUtf8().constData())));
 	}
+
+	void setBypassed(bool bypassed) { m_meter->setBypassed(bypassed); }
 
 private:
 	QLabel *m_title = nullptr;
+	QLabel *m_marker_value = nullptr;
 	QLabel *m_value = nullptr;
 	SegmentedMeter *m_meter = nullptr;
+	const char *m_marker_format_key = nullptr;
+};
+
+class GainMeter final : public QWidget {
+public:
+	explicit GainMeter(QWidget *parent = nullptr) : QWidget(parent)
+	{
+		setMinimumHeight(10);
+		setMaximumHeight(12);
+		setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+		setToolTip(localized("GainBarHelp"));
+	}
+
+	void setReading(float gain_db, float maximum_reduction_db, float maximum_boost_db)
+	{
+		const float next_gain = std::clamp(std::isfinite(gain_db) ? gain_db : 0.0f, -36.0f, 36.0f);
+		const float next_reduction =
+			std::clamp(std::isfinite(maximum_reduction_db) ? maximum_reduction_db : 0.0f, 0.0f, 36.0f);
+		const float next_boost =
+			std::clamp(std::isfinite(maximum_boost_db) ? maximum_boost_db : 0.0f, 0.0f, 36.0f);
+		if (std::fabs(next_gain - m_gain_db) < 0.1f &&
+		    std::fabs(next_reduction - m_maximum_reduction_db) < 0.1f &&
+		    std::fabs(next_boost - m_maximum_boost_db) < 0.1f)
+			return;
+		m_gain_db = next_gain;
+		m_maximum_reduction_db = next_reduction;
+		m_maximum_boost_db = next_boost;
+		update();
+	}
+
+	void setBypassed(bool bypassed)
+	{
+		if (m_bypassed == bypassed)
+			return;
+		m_bypassed = bypassed;
+		update();
+	}
+
+protected:
+	void paintEvent(QPaintEvent *event) override
+	{
+		Q_UNUSED(event);
+		QPainter painter(this);
+		painter.setRenderHint(QPainter::Antialiasing);
+		const QRectF bounds = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+		const QRectF inner = bounds.adjusted(2.0, 2.0, -2.0, -2.0);
+		painter.setPen(palette().color(QPalette::Mid));
+		painter.setBrush(palette().color(QPalette::Base));
+		painter.drawRoundedRect(bounds, 4.0, 4.0);
+		if (inner.width() <= 0.0)
+			return;
+
+		const double zero = inner.left() + inner.width() * 0.5;
+		const double gain_x = inner.left() + (static_cast<double>(m_gain_db) + 36.0) / 72.0 * inner.width();
+		if (std::fabs(gain_x - zero) > 0.5) {
+			const double left = std::min(zero, gain_x);
+			const double width = std::fabs(gain_x - zero);
+			const QColor fill = m_gain_db < 0.0f ? QColor(220, 151, 55)
+							     : palette().color(QPalette::Highlight);
+			painter.fillRect(QRectF(left, inner.top(), width, inner.height()), fill);
+		}
+
+		QColor limit_color = palette().color(QPalette::WindowText);
+		limit_color.setAlpha(m_bypassed ? 72 : 180);
+		painter.setPen(QPen(limit_color, 1.0));
+		const double reduction_x = inner.left() + (36.0 - m_maximum_reduction_db) / 72.0 * inner.width();
+		const double boost_x = inner.left() + (36.0 + m_maximum_boost_db) / 72.0 * inner.width();
+		painter.drawLine(QPointF(reduction_x, inner.top() - 1.0), QPointF(reduction_x, inner.bottom() + 1.0));
+		painter.drawLine(QPointF(boost_x, inner.top() - 1.0), QPointF(boost_x, inner.bottom() + 1.0));
+		painter.setPen(QPen(palette().color(QPalette::WindowText), 1.5));
+		painter.drawLine(QPointF(zero, inner.top() - 1.0), QPointF(zero, inner.bottom() + 1.0));
+	}
+
+private:
+	float m_gain_db = 0.0f;
+	float m_maximum_reduction_db = 18.0f;
+	float m_maximum_boost_db = 18.0f;
+	bool m_bypassed = false;
 };
 
 class SourceMonitorWidget final : public QFrame {
@@ -206,29 +339,76 @@ public:
 		header->addWidget(m_info);
 		layout->addLayout(header);
 
-		m_input = new MeterRow(localized("MonitorInputFast"), this);
-		m_output = new MeterRow(localized("MonitorOutputFast"), this);
+		m_input = new MeterRow(localized("MonitorInputFast"), -100.0f, 0.0f, "InputActivityMarkerHelp",
+				       "InputActivityFloorReadoutFormat", this);
+		m_output_fast =
+			new MeterRow(localized("MonitorOutputFast"), -60.0f, 0.0f, "FastMeterHelp", nullptr, this);
+		m_output_lufs = new MeterRow(localized("MonitorOutputMomentary"), -60.0f, 0.0f, "TargetLufsRailHelp",
+					     "TargetLufsReadoutFormat", this);
 		layout->addWidget(m_input);
-		layout->addWidget(m_output);
+		layout->addWidget(m_output_fast);
+		layout->addWidget(m_output_lufs);
 
 		m_momentary = new QLabel(localized("MonitorMomentaryUnavailable"), this);
 		m_short_term = new QLabel(localized("MonitorShortTermUnavailable"), this);
 		for (QLabel *label : {m_momentary, m_short_term}) {
-			label->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
+			label->setStyleSheet(QStringLiteral("font-size: 11px;"));
 			label->setToolTip(localized("RollingReadingsHelp"));
 		}
 		layout->addWidget(m_momentary);
 		layout->addWidget(m_short_term);
 
-		m_summary = new QLabel(localized("MonitorSummaryUnavailable"), this);
-		m_summary->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
-		layout->addWidget(m_summary);
+		auto *gain_row = new QHBoxLayout();
+		gain_row->setContentsMargins(0, 0, 0, 0);
+		gain_row->setSpacing(5);
+		m_gain_title = new QLabel(localized("MonitorGain"), this);
+		m_gain_title->setFixedWidth(MeterLabelWidth);
+		m_gain_title->setStyleSheet(QStringLiteral("font-size: 11px; font-weight: 700;"));
+		auto *gain_column = new QVBoxLayout();
+		gain_column->setContentsMargins(0, 0, 0, 0);
+		gain_column->setSpacing(1);
+		m_gain_meter = new GainMeter(this);
+		auto *gain_meta = new QHBoxLayout();
+		gain_meta->setContentsMargins(0, 0, 0, 0);
+		gain_meta->setSpacing(4);
+		m_gain_minimum = new QLabel(QStringLiteral("—"), this);
+		m_attack_tag = new QLabel(QStringLiteral("↓ — ms"), this);
+		m_recovery_tag = new QLabel(QStringLiteral("↑ — ms"), this);
+		m_gain_maximum = new QLabel(QStringLiteral("—"), this);
+		for (QLabel *label : {m_gain_minimum, m_attack_tag, m_recovery_tag, m_gain_maximum})
+			label->setStyleSheet(QStringLiteral("font-size: 11px;"));
+		m_gain_minimum->setToolTip(localized("GainBarHelp"));
+		m_gain_maximum->setToolTip(localized("GainBarHelp"));
+		m_attack_tag->setToolTip(localized("GainAttackTagTooltip"));
+		m_recovery_tag->setToolTip(localized("GainRecoveryTagTooltip"));
+		gain_meta->addWidget(m_gain_minimum);
+		gain_meta->addStretch(1);
+		gain_meta->addWidget(m_attack_tag);
+		gain_meta->addWidget(m_recovery_tag);
+		gain_meta->addStretch(1);
+		gain_meta->addWidget(m_gain_maximum);
+		gain_column->addWidget(m_gain_meter);
+		m_gain_value = new QLabel(localized("MonitorGainUnavailable"), this);
+		m_gain_value->setMinimumWidth(78);
+		m_gain_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		m_gain_value->setStyleSheet(QStringLiteral("font-size: 16px; font-weight: 700;"));
+		gain_row->addWidget(m_gain_title);
+		gain_row->addLayout(gain_column, 1);
+		gain_row->addWidget(m_gain_value);
+		layout->addLayout(gain_row);
+		layout->addLayout(gain_meta);
+
+		m_peak_summary = new QLabel(localized("MonitorPeakSummaryUnavailable"), this);
+		m_peak_summary->setStyleSheet(QStringLiteral("font-size: 11px;"));
+		m_peak_summary->setToolTip(localized("PeakMeterHelp"));
+		layout->addWidget(m_peak_summary);
 		m_peak_meter = new SegmentedMeter(this);
+		m_peak_meter->setScale(-60.0f, 0.0f);
 		m_peak_meter->setToolTip(localized("PeakMeterHelp"));
 		layout->addWidget(m_peak_meter);
 
 		m_latency = new QLabel(localized("MonitorLatencyUnavailable"), this);
-		m_latency->setStyleSheet(QStringLiteral("font-size: 11px; font-variant-numeric: tabular-nums;"));
+		m_latency->setStyleSheet(QStringLiteral("font-size: 11px;"));
 		m_latency->setToolTip(localized("MonitorLatencyHelp"));
 		layout->addWidget(m_latency);
 
@@ -254,12 +434,14 @@ public:
 		const bool available = snapshot.source_available && snapshot.stats_available &&
 				       m_last_audio_update.isValid() && m_last_audio_update.elapsed() < 300;
 		const auto &stats = snapshot.stats;
-		const QString status_text = !available ? localized("MonitorWaiting")
-						       : (stats.activity_open ? localized("MonitorConnected")
-									      : localized("ActivityPaused"));
+		const QString status_text =
+			!available ? localized("MonitorWaiting")
+				   : (stats.bypass ? localized("MonitorBypassed")
+						   : (stats.activity_open ? localized("MonitorConnected")
+									  : localized("ActivityPaused")));
 		set_label_text(m_status, status_text);
-		const QColor status_color =
-			palette().color(available && stats.activity_open ? QPalette::Highlight : QPalette::Mid);
+		const QColor status_color = palette().color(
+			available && !stats.bypass && stats.activity_open ? QPalette::Highlight : QPalette::Mid);
 		const QString status_style = QStringLiteral("font-size: 11px; color: %1;").arg(status_color.name());
 		if (m_status_dot->styleSheet() != status_style)
 			m_status_dot->setStyleSheet(status_style);
@@ -268,30 +450,54 @@ public:
 
 		if (!available) {
 			m_input->setReading(-120.0f, QStringLiteral("dBFS"));
-			m_output->setReading(-120.0f, QStringLiteral("dBFS"));
+			m_output_fast->setReading(-120.0f, QStringLiteral("dBFS"));
+			m_output_lufs->setReading(-120.0f, QStringLiteral("LUFS"));
 			set_label_text(m_momentary, localized("MonitorMomentaryUnavailable"));
 			set_label_text(m_short_term, localized("MonitorShortTermUnavailable"));
-			set_label_text(m_summary, localized("MonitorSummaryUnavailable"));
+			set_label_text(m_gain_value, localized("MonitorGainUnavailable"));
+			set_label_text(m_gain_minimum, QStringLiteral("—"));
+			set_label_text(m_gain_maximum, QStringLiteral("—"));
+			set_label_text(m_attack_tag, QStringLiteral("↓ — ms"));
+			set_label_text(m_recovery_tag, QStringLiteral("↑ — ms"));
+			m_gain_meter->setReading(0.0f, 0.0f, 0.0f);
+			m_gain_meter->setBypassed(false);
+			m_input->setBypassed(false);
+			m_output_fast->setBypassed(false);
+			m_output_lufs->setBypassed(false);
+			set_label_text(m_peak_summary, localized("MonitorPeakSummaryUnavailable"));
 			m_peak_meter->setValue(-120.0f);
+			m_peak_meter->setBypassed(false);
 			set_label_text(m_latency, localized("MonitorLatencyUnavailable"));
 			return;
 		}
 
-		m_input->setReading(stats.input_fast_rms_dbfs, QStringLiteral("dBFS"));
-		m_output->setReading(stats.output_fast_rms_dbfs, QStringLiteral("dBFS"));
-		set_label_text(m_momentary, localized("MonitorMomentaryFormat")
-						    .arg(db_text(stats.input_momentary_lufs, "LUFS"),
-							 db_text(stats.output_momentary_lufs, "LUFS")));
+		m_input->setReading(stats.input_fast_rms_dbfs, QStringLiteral("dBFS"), stats.noise_floor_dbfs);
+		m_input->setBypassed(stats.bypass);
+		m_output_fast->setReading(stats.output_fast_rms_dbfs, QStringLiteral("dBFS"));
+		m_output_fast->setBypassed(stats.bypass);
+		m_output_lufs->setReading(stats.output_momentary_lufs, QStringLiteral("LUFS"), stats.target_lufs);
+		m_output_lufs->setBypassed(stats.bypass);
+		set_label_text(m_momentary,
+			       localized("MonitorMomentaryFormat").arg(db_text(stats.input_momentary_lufs, "LUFS")));
 		set_label_text(m_short_term, localized("MonitorShortTermFormat")
 						     .arg(db_text(stats.input_short_term_lufs, "LUFS"),
 							  db_text(stats.output_short_term_lufs, "LUFS")));
-		const QString gain = QStringLiteral("%1%2 dB")
-					     .arg(stats.gain_db > 0.05f ? QStringLiteral("+") : QString())
-					     .arg(stats.gain_db, 0, 'f', 1);
-		set_label_text(m_summary, localized("MonitorSummaryFormat")
-						  .arg(gain, db_text(stats.peak_hold_dbtp, "dBTP"),
-						       db_text(stats.peak_ceiling_dbtp, "dBTP")));
+		const QString gain_text = QStringLiteral("%1%2 dB")
+						  .arg(stats.gain_db > 0.05f ? QStringLiteral("+") : QString())
+						  .arg(stats.gain_db, 0, 'f', 1);
+		set_label_text(m_gain_value, gain_text);
+		m_gain_meter->setReading(stats.gain_db, stats.max_reduction_db, stats.max_boost_db);
+		m_gain_meter->setBypassed(stats.bypass);
+		set_label_text(m_gain_minimum,
+			       localized("GainRangeMinimumFormat").arg(stats.max_reduction_db, 0, 'f', 1));
+		set_label_text(m_gain_maximum, localized("GainRangeMaximumFormat").arg(stats.max_boost_db, 0, 'f', 1));
+		set_label_text(m_attack_tag, localized("GainAttackTagFormat").arg(stats.attack_ms, 0, 'f', 0));
+		set_label_text(m_recovery_tag, localized("GainRecoveryTagFormat").arg(stats.recovery_ms, 0, 'f', 0));
+		set_label_text(m_peak_summary, localized("MonitorPeakSummaryFormat")
+						       .arg(db_text(stats.peak_hold_dbtp, "dBTP"),
+							    db_text(stats.peak_ceiling_dbtp, "dBTP")));
 		m_peak_meter->setValue(stats.peak_hold_dbtp, stats.peak_ceiling_dbtp);
+		m_peak_meter->setBypassed(stats.bypass);
 		if (std::isfinite(stats.sample_rate_hz) && stats.sample_rate_hz > 0.0f) {
 			const float latency_ms = lvb_output_latency_ms(stats.sample_rate_hz);
 			set_label_text(m_latency, localized("MonitorLatencyFormat")
@@ -329,12 +535,20 @@ private:
 	QLabel *m_status = nullptr;
 	QLabel *m_momentary = nullptr;
 	QLabel *m_short_term = nullptr;
-	QLabel *m_summary = nullptr;
+	QLabel *m_gain_title = nullptr;
+	QLabel *m_gain_value = nullptr;
+	QLabel *m_gain_minimum = nullptr;
+	QLabel *m_gain_maximum = nullptr;
+	QLabel *m_attack_tag = nullptr;
+	QLabel *m_recovery_tag = nullptr;
+	QLabel *m_peak_summary = nullptr;
 	QLabel *m_latency = nullptr;
 	QToolButton *m_settings = nullptr;
 	QToolButton *m_info = nullptr;
 	MeterRow *m_input = nullptr;
-	MeterRow *m_output = nullptr;
+	MeterRow *m_output_fast = nullptr;
+	MeterRow *m_output_lufs = nullptr;
+	GainMeter *m_gain_meter = nullptr;
 	SegmentedMeter *m_peak_meter = nullptr;
 	QElapsedTimer m_last_audio_update;
 	uint32_t m_last_sequence = 0;
