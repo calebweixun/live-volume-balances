@@ -26,6 +26,8 @@ static struct lvb_settings test_settings(void)
 		.max_reduction_db = 18.0f,
 		.noise_floor_db = -46.0f,
 		.fader_smoothness = LVB_FADER_SMOOTHNESS_DEFAULT,
+		.activity_reentry_speed = LVB_ACTIVITY_REENTRY_SPEED_DEFAULT,
+		.loudness_jump_response = LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT,
 		.quiet_attenuation_db = 0.0f,
 		.peak_ceiling_db = -1.0f,
 		.bypass = false,
@@ -164,7 +166,7 @@ static float process_sermon_with_room_noise(struct lvb_state *state, const struc
 }
 
 static float mixed_syllable_gain_swing(float smoothness, float *maximum_peak_dbtp,
-				       float *maximum_quiet_transition_seconds)
+				       float *maximum_quiet_transition_seconds, bool *jump_activated)
 {
 	struct lvb_settings settings = test_settings();
 	settings.fader_smoothness = smoothness;
@@ -180,6 +182,8 @@ static float mixed_syllable_gain_swing(float smoothness, float *maximum_peak_dbt
 		*maximum_peak_dbtp = -120.0f;
 	if (maximum_quiet_transition_seconds)
 		*maximum_quiet_transition_seconds = 0.0f;
+	if (jump_activated)
+		*jump_activated = false;
 
 	/* Establish a continuous music bed before adding short loud vocal phrases. */
 	process_segment(&state, &settings, 48000.0f, 330.0f, 0.045f, 48000U * 4U, 0, NULL);
@@ -203,6 +207,8 @@ static float mixed_syllable_gain_swing(float smoothness, float *maximum_peak_dbt
 				samples[i] = music + voice;
 			}
 			lvb_process(&state, &settings, 1, planes, count, 48000.0f);
+			if (jump_activated && state.loudness_jump_active)
+				*jump_activated = true;
 			if (cycle_position < 48000U / 5U) {
 				if (state.gain_db < minimum_gain_db)
 					minimum_gain_db = state.gain_db;
@@ -310,10 +316,11 @@ static int test_fader_curve_reduces_mixed_program_syllable_pumping(void)
 	float legacy_peak = -120.0f;
 	float smooth_peak = -120.0f;
 	float maximum_quiet_transition_seconds = 0.0f;
-	const float legacy_swing = mixed_syllable_gain_swing(0.0f, &legacy_peak, NULL);
+	bool jump_activated = false;
+	const float legacy_swing = mixed_syllable_gain_swing(0.0f, &legacy_peak, NULL, NULL);
 	const float smooth_swing = mixed_syllable_gain_swing(LVB_FADER_SMOOTHNESS_DEFAULT, &smooth_peak,
-							     &maximum_quiet_transition_seconds);
-	const float maximum_smooth_swing = mixed_syllable_gain_swing(100.0f, NULL, NULL);
+							     &maximum_quiet_transition_seconds, &jump_activated);
+	const float maximum_smooth_swing = mixed_syllable_gain_swing(100.0f, NULL, NULL, NULL);
 	CHECK(legacy_swing > 1.0f, "test phrases must exercise the legacy gain rider");
 	CHECK(smooth_swing <= 3.0f, "default fader curve should keep short mixed-program gain swings at or below 3 dB");
 	CHECK(maximum_smooth_swing <= 3.0f, "maximum smoothness should keep short phrase gain swings below 3 dB");
@@ -322,6 +329,179 @@ static int test_fader_curve_reduces_mixed_program_syllable_pumping(void)
 	CHECK(smooth_swing <= legacy_swing - 5.0f,
 	      "default fader curve should reduce short mixed-program gain swings by at least 5 dB");
 	CHECK(smooth_peak <= -0.65f, "fader movement must retain independent fast peak protection");
+	CHECK(!jump_activated, "200 ms mixed speech phrases must not trigger the sustained loudness-jump assist");
+	return 0;
+}
+
+struct loudness_jump_result {
+	float initial_main_gain_db;
+	float main_gain_500ms_db;
+	float net_gain_500ms_db;
+	float output_500ms_lufs;
+	float output_500ms_fast_dbfs;
+	float main_gain_2s_db;
+	float net_gain_2s_db;
+	float output_2s_lufs;
+	float main_gain_8s_db;
+	float net_gain_8s_db;
+	float activation_seconds;
+	float maximum_peak_dbtp;
+	bool peak_limited;
+};
+
+static struct loudness_jump_result run_loudness_jump_transition(float sample_rate, float target_lufs, float response,
+								float peak_ceiling_db, bool irregular_blocks)
+{
+	struct lvb_settings settings = test_settings();
+	settings.target_lufs = target_lufs;
+	settings.max_boost_db = 12.0f;
+	settings.max_reduction_db = 12.5f;
+	settings.noise_floor_db = -50.0f;
+	settings.fader_smoothness = 85.0f;
+	settings.activity_reentry_speed = 0.0f;
+	settings.loudness_jump_response = response;
+	settings.quiet_attenuation_db = 3.0f;
+	settings.peak_ceiling_db = peak_ceiling_db;
+
+	struct lvb_state state;
+	lvb_state_init(&state);
+	const size_t one_second_frames = (size_t)sample_rate;
+	process_segment(&state, &settings, sample_rate, 440.0f, 0.025f, one_second_frames * 8U, 0, NULL);
+	struct loudness_jump_result result = {
+		.initial_main_gain_db = (float)state.gain_db,
+		.main_gain_500ms_db = NAN,
+		.net_gain_500ms_db = NAN,
+		.output_500ms_lufs = NAN,
+		.output_500ms_fast_dbfs = NAN,
+		.main_gain_2s_db = NAN,
+		.net_gain_2s_db = NAN,
+		.output_2s_lufs = NAN,
+		.main_gain_8s_db = NAN,
+		.net_gain_8s_db = NAN,
+		.activation_seconds = -1.0f,
+		.maximum_peak_dbtp = -120.0f,
+		.peak_limited = false,
+	};
+	float samples[521];
+	float *planes[] = {samples};
+	const size_t irregular_sizes[] = {137, 511, 233, 89, 521, 317};
+	size_t position = 0;
+	const size_t transition_frames = one_second_frames * 8U;
+	while (position < transition_frames) {
+		const size_t block_index = (position / 137U) % (sizeof(irregular_sizes) / sizeof(irregular_sizes[0]));
+		const size_t requested = irregular_blocks ? irregular_sizes[block_index] : one_second_frames / 100U;
+		const size_t count = requested < transition_frames - position ? requested
+									      : transition_frames - position;
+		for (size_t i = 0; i < count; i++) {
+			const float time = (float)(one_second_frames * 8U + position + i) / sample_rate;
+			samples[i] = 0.11f * sinf(6.28318530717958647692f * 660.0f * time) +
+				     0.035f * sinf(6.28318530717958647692f * 220.0f * time);
+		}
+		lvb_process(&state, &settings, 1, planes, count, sample_rate);
+		const float elapsed = (float)(position + count) / sample_rate;
+		if (state.loudness_jump_active && result.activation_seconds < 0.0f)
+			result.activation_seconds = elapsed;
+		if (state.stats.true_peak_dbtp > result.maximum_peak_dbtp)
+			result.maximum_peak_dbtp = state.stats.true_peak_dbtp;
+		result.peak_limited = result.peak_limited || state.stats.peak_ceiling_limiting;
+		if (elapsed >= 0.5f && !isfinite(result.main_gain_500ms_db)) {
+			result.main_gain_500ms_db = (float)state.gain_db;
+			result.net_gain_500ms_db = state.stats.gain_db;
+			result.output_500ms_lufs = state.stats.output_momentary_lufs;
+			result.output_500ms_fast_dbfs = state.stats.output_fast_rms_dbfs;
+		}
+		if (elapsed >= 2.0f && !isfinite(result.main_gain_2s_db)) {
+			result.main_gain_2s_db = (float)state.gain_db;
+			result.net_gain_2s_db = state.stats.gain_db;
+			result.output_2s_lufs = state.stats.output_momentary_lufs;
+		}
+		if (elapsed >= 8.0f) {
+			result.main_gain_8s_db = (float)state.gain_db;
+			result.net_gain_8s_db = state.stats.gain_db;
+		}
+		position += count;
+	}
+	return result;
+}
+
+static int test_loudness_jump_response_handles_sustained_program_change(void)
+{
+	const struct loudness_jump_result disabled = run_loudness_jump_transition(48000.0f, -21.0f, 0.0f, -1.0f, true);
+	const struct loudness_jump_result default_response =
+		run_loudness_jump_transition(48000.0f, -21.0f, LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT, -1.0f, true);
+	const struct loudness_jump_result regular_blocks =
+		run_loudness_jump_transition(48000.0f, -21.0f, LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT, -1.0f, false);
+	const struct loudness_jump_result at_44100 =
+		run_loudness_jump_transition(44100.0f, -21.0f, LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT, -1.0f, true);
+	const struct loudness_jump_result maximum_response =
+		run_loudness_jump_transition(48000.0f, -6.0f, LVB_LOUDNESS_JUMP_RESPONSE_MAX, -9.0f, true);
+	CHECK(fabsf(disabled.initial_main_gain_db - default_response.initial_main_gain_db) < 0.1f,
+	      "jump response must not alter the established sermon gain before a transition");
+	CHECK(disabled.activation_seconds < 0.0f && default_response.activation_seconds > 0.20f &&
+		      default_response.activation_seconds < 0.60f,
+	      "default response should confirm a sustained loudness rise without acting on startup");
+	CHECK(default_response.net_gain_500ms_db < disabled.net_gain_500ms_db - 1.0f &&
+		      default_response.output_500ms_fast_dbfs < disabled.output_500ms_fast_dbfs - 0.4f,
+	      "confirmed jump assist should lower the main fader and fast output within the first half-second");
+	CHECK(default_response.main_gain_2s_db < disabled.main_gain_2s_db - 2.0f &&
+		      default_response.output_2s_lufs < disabled.output_2s_lufs - 3.0f,
+	      "confirmed jump assist should transfer sustained downward correction to the main fader");
+	CHECK(fabsf(default_response.main_gain_8s_db - disabled.main_gain_8s_db) < 1.0f,
+	      "jump assistance must converge to the same rolling target after the program stabilizes");
+	CHECK(default_response.maximum_peak_dbtp <= -0.65f,
+	      "the faster program transition must retain independent FIR peak protection");
+	CHECK(at_44100.activation_seconds > 0.20f && at_44100.activation_seconds < 0.65f &&
+		      fabsf(at_44100.main_gain_2s_db - default_response.main_gain_2s_db) < 0.75f,
+	      "jump confirmation and fader movement should behave similarly at 44.1 and 48 kHz");
+	CHECK(maximum_response.activation_seconds > 0.20f && maximum_response.activation_seconds < 0.60f &&
+		      maximum_response.peak_limited && maximum_response.maximum_peak_dbtp <= -8.65f,
+	      "maximum event response should act only after confirmation and keep the peak guard ceiling");
+	CHECK(fabsf(default_response.activation_seconds - regular_blocks.activation_seconds) < 0.025f &&
+		      fabsf(default_response.main_gain_2s_db - regular_blocks.main_gain_2s_db) < 0.5f,
+	      "jump confirmation and fader descent should remain stable across callback block sizes");
+	return 0;
+}
+
+static float run_loudness_jump_accent(float response, bool *activated)
+{
+	struct lvb_settings settings = test_settings();
+	settings.loudness_jump_response = response;
+	struct lvb_state state;
+	lvb_state_init(&state);
+	process_segment(&state, &settings, 48000.0f, 330.0f, 0.045f, 48000U * 4U, 0, NULL);
+	float samples[521];
+	float *planes[] = {samples};
+	size_t position = 0;
+	const size_t accent_frames = 4800U;
+	const size_t total_frames = 48000U * 2U;
+	while (position < total_frames) {
+		const size_t count = 521U < total_frames - position ? 521U : total_frames - position;
+		for (size_t i = 0; i < count; i++) {
+			const size_t frame = 48000U * 4U + position + i;
+			const float time = (float)frame / 48000.0f;
+			const float music = 0.045f * sinf(6.28318530717958647692f * 330.0f * time);
+			const float accent = position + i < accent_frames
+						     ? 0.24f * sinf(6.28318530717958647692f * 1250.0f * time)
+						     : 0.0f;
+			samples[i] = music + accent;
+		}
+		lvb_process(&state, &settings, 1, planes, count, 48000.0f);
+		*activated = *activated || state.loudness_jump_active;
+		position += count;
+	}
+	return (float)state.gain_db;
+}
+
+static int test_loudness_jump_response_ignores_100ms_accent(void)
+{
+	bool disabled_activated = false;
+	bool enabled_activated = false;
+	const float disabled_gain_db = run_loudness_jump_accent(0.0f, &disabled_activated);
+	const float enabled_gain_db = run_loudness_jump_accent(LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT, &enabled_activated);
+	CHECK(!disabled_activated && !enabled_activated,
+	      "a 100 ms accent must not arm or latch the sustained loudness-jump response");
+	CHECK(fabsf(enabled_gain_db - disabled_gain_db) < 0.25f,
+	      "an isolated 100 ms accent must not change fader behavior versus the assist being disabled");
 	return 0;
 }
 
@@ -363,6 +543,159 @@ static int test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely(void)
 	      "gain riding should lower gain within a second when a loud band starts");
 	CHECK(peak <= settings.peak_ceiling_db + 0.35f,
 	      "the output peak guard should remain active during transitions");
+	return 0;
+}
+
+static int test_screenshot_settings_show_net_band_onset_and_peak_limited_target(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.target_lufs = -10.0f;
+	settings.max_boost_db = 17.0f;
+	settings.max_reduction_db = 12.5f;
+	settings.noise_floor_db = -50.0f;
+	settings.fader_smoothness = 85.0f;
+	settings.quiet_attenuation_db = 3.0f;
+	settings.peak_ceiling_db = -7.1f;
+
+	struct lvb_state onset_state;
+	lvb_state_init(&onset_state);
+	process_segment(&onset_state, &settings, 48000.0f, 440.0f, 0.025f, 48000U * 8U, 0, NULL);
+	CHECK(onset_state.gain_db > 10.0, "screenshot settings should establish boosted gain during quiet speech");
+	float onset_peak_dbtp = -120.0f;
+	process_segment(&onset_state, &settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &onset_peak_dbtp);
+	CHECK(onset_state.gain_db > 0.0,
+	      "the smooth main fader should remain positive briefly as it begins a large downward transition");
+	CHECK(onset_state.stats.gain_db < 0.0f,
+	      "the displayed net gain should include the fast peak guard and turn negative on a high-level band onset");
+	CHECK(onset_peak_dbtp <= settings.peak_ceiling_db + 0.35f,
+	      "the band-onset peak guard should keep the output near the configured ceiling");
+
+	struct lvb_state peak_limited_state;
+	lvb_state_init(&peak_limited_state);
+	process_segment(&peak_limited_state, &settings, 48000.0f, 440.0f, 0.025f, 48000U * 8U, 0, NULL);
+	float samples[4800];
+	float *planes[] = {samples};
+	uint32_t frame_position = 48000U * 8U;
+	float maximum_peak_hold_dbtp = -120.0f;
+	for (size_t block = 0; block < 80; block++) {
+		for (size_t i = 0; i < 4800; i++) {
+			const uint32_t frame = frame_position + (uint32_t)i;
+			float sample = 0.08f * sinf(6.28318530717958647692f * 440.0f * (float)frame / 48000.0f);
+			if (i < 480U)
+				sample += 0.8f * sinf(6.28318530717958647692f * 1100.0f * (float)frame / 48000.0f);
+			samples[i] = sample;
+		}
+		lvb_process(&peak_limited_state, &settings, 1, planes, 4800, 48000.0f);
+		if (peak_limited_state.stats.peak_hold_dbtp > maximum_peak_hold_dbtp)
+			maximum_peak_hold_dbtp = peak_limited_state.stats.peak_hold_dbtp;
+		frame_position += 4800U;
+	}
+	CHECK(peak_limited_state.stats.peak_ceiling_limiting,
+	      "the dock should identify when peak headroom prevents an under-target rolling output from reaching its goal");
+	CHECK(peak_limited_state.stats.output_momentary_lufs < settings.target_lufs - 5.0f,
+	      "a high-crest program can remain well below target even while its peaks reach the safety ceiling");
+	CHECK(peak_limited_state.stats.gain_db < 0.0f,
+	      "net applied gain should become negative after the fader takes over sustained peak-ceiling work");
+	CHECK(maximum_peak_hold_dbtp <= settings.peak_ceiling_db + 0.35f,
+	      "peak-aware rider and FIR guard must keep the high-crest program within the configured peak ceiling");
+
+	struct lvb_settings boost_limited_settings = test_settings();
+	boost_limited_settings.target_lufs = -14.0f;
+	boost_limited_settings.max_boost_db = 12.0f;
+	boost_limited_settings.noise_floor_db = -50.0f;
+	boost_limited_settings.peak_ceiling_db = 0.0f;
+	struct lvb_state boost_limited_state;
+	lvb_state_init(&boost_limited_state);
+	process_segment(&boost_limited_state, &boost_limited_settings, 48000.0f, 900.0f, 0.025f, 48000U / 5U, 0, NULL);
+	CHECK(!boost_limited_state.stats.max_boost_limiting,
+	      "the target cue should stay off while the main fader is still ramping toward its boost cap");
+	process_segment(&boost_limited_state, &boost_limited_settings, 48000.0f, 900.0f, 0.025f, 48000U * 8U, 0, NULL);
+	CHECK(boost_limited_state.stats.max_boost_limiting && !boost_limited_state.stats.peak_ceiling_limiting,
+	      "a quiet input that reaches the +12 dB cap should report BOOST, distinct from peak-ceiling limiting");
+	CHECK(boost_limited_state.gain_db >= 11.0 && boost_limited_state.gain_db <= 12.1,
+	      "BOOST should appear only when the actual main fader is close to its configured cap");
+	return 0;
+}
+
+static void prepare_closed_reentry_state(struct lvb_state *state, const struct lvb_settings *settings)
+{
+	process_sermon_with_room_noise(state, settings, 0, 48000U * 2U, true, 0.025f, 0.0f, NULL, NULL);
+	process_noise_segment(state, settings, 48000.0f, 0.0f, 48000U * 6U, 0, NULL);
+}
+
+static int test_activity_reentry_speed_is_separate_and_noise_safe(void)
+{
+	struct lvb_settings slow_settings = test_settings();
+	slow_settings.target_lufs = -14.0f;
+	slow_settings.max_boost_db = 12.0f;
+	slow_settings.max_reduction_db = 12.5f;
+	slow_settings.noise_floor_db = -50.0f;
+	slow_settings.fader_smoothness = 85.0f;
+	slow_settings.activity_reentry_speed = 0.0f;
+	slow_settings.quiet_attenuation_db = 3.0f;
+	slow_settings.peak_ceiling_db = -1.0f;
+	struct lvb_settings fast_settings = slow_settings;
+	fast_settings.activity_reentry_speed = LVB_ACTIVITY_REENTRY_SPEED_DEFAULT;
+	struct lvb_settings fastest_settings = slow_settings;
+	fastest_settings.activity_reentry_speed = LVB_ACTIVITY_REENTRY_SPEED_MAX;
+	struct lvb_state slow_state, fast_state, fastest_state;
+	lvb_state_init(&slow_state);
+	lvb_state_init(&fast_state);
+	lvb_state_init(&fastest_state);
+	prepare_closed_reentry_state(&slow_state, &slow_settings);
+	prepare_closed_reentry_state(&fast_state, &fast_settings);
+	prepare_closed_reentry_state(&fastest_state, &fastest_settings);
+	CHECK(!slow_state.stats.activity_open && !fast_state.stats.activity_open && !fastest_state.stats.activity_open,
+	      "the re-entry comparison must start after the same closed activity gate");
+	CHECK(fabsf((float)slow_state.gain_db - (float)fast_state.gain_db) < 0.05f &&
+		      fabsf((float)slow_state.gain_db - (float)fastest_state.gain_db) < 0.05f,
+	      "re-entry speed should not change initial startup or the settled quiet endpoint");
+
+	float slow_peak = -120.0f, fast_peak = -120.0f, fastest_peak = -120.0f;
+	process_sermon_with_room_noise(&slow_state, &slow_settings, 0, 48000U / 2U, true, 0.025f, 0.0f, NULL,
+				       &slow_peak);
+	process_sermon_with_room_noise(&fast_state, &fast_settings, 0, 48000U / 2U, true, 0.025f, 0.0f, NULL,
+				       &fast_peak);
+	process_sermon_with_room_noise(&fastest_state, &fastest_settings, 0, 48000U / 2U, true, 0.025f, 0.0f, NULL,
+				       &fastest_peak);
+	CHECK(fast_state.gain_db > slow_state.gain_db + 1.5,
+	      "default re-entry speed should regain useful gain faster than normal smoothness during the first 500 ms");
+	CHECK(fastest_state.gain_db > fast_state.gain_db + 0.5,
+	      "maximum re-entry speed should recover more quickly than the default without changing the main smoothness setting");
+	CHECK(fast_state.stats.output_momentary_lufs > slow_state.stats.output_momentary_lufs + 0.5f,
+	      "faster confirmed re-entry should improve the first half-second rolling output level");
+	CHECK(slow_peak <= slow_settings.peak_ceiling_db + 0.35f &&
+		      fast_peak <= fast_settings.peak_ceiling_db + 0.35f &&
+		      fastest_peak <= fastest_settings.peak_ceiling_db + 0.35f,
+	      "re-entry assistance must preserve the same FIR peak ceiling");
+
+	struct lvb_state noise_state;
+	lvb_state_init(&noise_state);
+	prepare_closed_reentry_state(&noise_state, &fast_settings);
+	const float gain_at_quiet_endpoint = noise_state.stats.gain_db;
+	const float floor_plus_five = db_to_linear(-45.0f) * sqrtf(3.0f);
+	process_noise_segment(&noise_state, &fastest_settings, 48000.0f, floor_plus_five, 48000U * 4U, 0, NULL);
+	CHECK(!noise_state.stats.activity_open && noise_state.activity_reentry_seconds == 0.0f &&
+		      noise_state.stats.gain_db <= gain_at_quiet_endpoint + 0.5f,
+	      "steady −45 dBFS room ambience must neither open the gate nor arm faster re-entry or upward gain");
+
+	struct lvb_state slow_band_state, fast_band_state, fastest_band_state;
+	lvb_state_init(&slow_band_state);
+	lvb_state_init(&fast_band_state);
+	lvb_state_init(&fastest_band_state);
+	prepare_closed_reentry_state(&slow_band_state, &slow_settings);
+	prepare_closed_reentry_state(&fast_band_state, &fast_settings);
+	prepare_closed_reentry_state(&fastest_band_state, &fastest_settings);
+	process_segment(&slow_band_state, &slow_settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &slow_peak);
+	process_segment(&fast_band_state, &fast_settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &fast_peak);
+	process_segment(&fastest_band_state, &fastest_settings, 48000.0f, 900.0f, 0.62f, 48000U / 2U, 0, &fastest_peak);
+	CHECK(fabs((double)slow_band_state.gain_db - fast_band_state.gain_db) < 1.0 &&
+		      fabs((double)slow_band_state.gain_db - fastest_band_state.gain_db) < 1.0,
+	      "the re-entry speed should not materially slow downward gain response on sudden full-band onset");
+	CHECK(slow_peak <= slow_settings.peak_ceiling_db + 0.35f &&
+		      fast_peak <= fast_settings.peak_ceiling_db + 0.35f &&
+		      fastest_peak <= fastest_settings.peak_ceiling_db + 0.35f,
+	      "sudden full-band onset must remain under the peak ceiling at both re-entry speed settings");
 	return 0;
 }
 
@@ -793,10 +1126,18 @@ int main(void)
 	      "steady band and sermon normalization");
 	CHECK(test_fader_curve_reduces_mixed_program_syllable_pumping() == 0,
 	      "fader curve reduces mixed-program syllable pumping");
+	CHECK(test_loudness_jump_response_handles_sustained_program_change() == 0,
+	      "sustained program loudness jump receives faster bounded downward riding");
+	CHECK(test_loudness_jump_response_ignores_100ms_accent() == 0,
+	      "isolated accent does not trigger faster downward riding");
 	CHECK(test_tiny_gain_steps_keep_linear_and_db_state_synchronized() == 0,
 	      "small per-sample gain steps preserve linear and dB precision");
 	CHECK(test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely() == 0,
 	      "quiet sermon to full-band transition");
+	CHECK(test_screenshot_settings_show_net_band_onset_and_peak_limited_target() == 0,
+	      "screenshot settings show net gain at band onset and target limited by peak ceiling");
+	CHECK(test_activity_reentry_speed_is_separate_and_noise_safe() == 0,
+	      "activity re-entry speed improves speech reacquisition without lifting room noise or delaying band reduction");
 	CHECK(test_speech_gaps_hold_fader_and_floor_plus_two_does_not_reopen() == 0,
 	      "short speech gaps, held fader, quiet endpoint and noise-floor behavior");
 	CHECK(test_ambiguous_room_noise_does_not_extend_activity_hangover() == 0,

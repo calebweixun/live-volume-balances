@@ -20,6 +20,12 @@
 #define LVB_FADER_SMOOTHNESS_MIN 0.0f
 #define LVB_FADER_SMOOTHNESS_MAX 100.0f
 #define LVB_FADER_SMOOTHNESS_DEFAULT 85.0f
+#define LVB_ACTIVITY_REENTRY_SPEED_MIN 0.0f
+#define LVB_ACTIVITY_REENTRY_SPEED_MAX 100.0f
+#define LVB_ACTIVITY_REENTRY_SPEED_DEFAULT 75.0f
+#define LVB_LOUDNESS_JUMP_RESPONSE_MIN 0.0f
+#define LVB_LOUDNESS_JUMP_RESPONSE_MAX 100.0f
+#define LVB_LOUDNESS_JUMP_RESPONSE_DEFAULT 75.0f
 #define LVB_QUIET_ATTENUATION_MIN 0.0f
 #define LVB_QUIET_ATTENUATION_MAX 12.0f
 
@@ -29,6 +35,8 @@ struct lvb_settings {
 	float max_reduction_db;
 	float noise_floor_db;
 	float fader_smoothness;
+	float activity_reentry_speed;
+	float loudness_jump_response;
 	float quiet_attenuation_db;
 	float peak_ceiling_db;
 	bool bypass;
@@ -50,10 +58,14 @@ struct lvb_stats {
 	float max_reduction_db;
 	float noise_floor_dbfs;
 	float fader_smoothness;
+	float activity_reentry_speed;
+	float loudness_jump_response;
 	float quiet_attenuation_db;
 	float sample_rate_hz;
 	bool activity_open;
 	bool bypass;
+	bool peak_ceiling_limiting;
+	bool max_boost_limiting;
 };
 
 struct lvb_biquad_state {
@@ -91,6 +103,13 @@ struct lvb_state {
 	float activity_reference_dbfs;
 	float activity_hold_seconds;
 	float quiet_transition_seconds;
+	float activity_reentry_candidate_seconds;
+	float activity_reentry_seconds;
+	float loudness_jump_candidate_seconds;
+	float loudness_jump_candidate_gap_seconds;
+	float loudness_jump_rms_reference_dbfs;
+	float loudness_jump_clear_seconds;
+	float loudness_jump_cooldown_seconds;
 	float peak_hold_dbtp;
 	float peak_hold_seconds;
 	double activity_energy;
@@ -103,6 +122,13 @@ struct lvb_state {
 	uint32_t true_peak_delay_frames;
 	bool activity_reference_valid;
 	bool activity_open;
+	bool activity_reentry_armed;
+	bool activity_reentry_pending;
+	bool loudness_jump_armed;
+	bool loudness_jump_active;
+	bool loudness_jump_rms_reference_valid;
+	bool peak_ceiling_limiting;
+	bool max_boost_limiting;
 	float true_peak_history[LVB_MAX_CHANNELS][LVB_TRUE_PEAK_TAPS];
 	float output_peak_history[LVB_MAX_CHANNELS][LVB_TRUE_PEAK_TAPS];
 	float true_peak_delay[LVB_MAX_CHANNELS][LVB_TRUE_PEAK_LATENCY];

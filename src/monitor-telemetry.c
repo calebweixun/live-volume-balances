@@ -16,7 +16,7 @@ typedef volatile LONG lvb_atomic_uint32_t;
 typedef _Atomic(uint32_t) lvb_atomic_uint32_t;
 #endif
 
-#define LVB_TELEMETRY_STATS_COUNT 17
+#define LVB_TELEMETRY_STATS_COUNT 19
 
 struct lvb_telemetry_slot {
 	lvb_atomic_uint32_t owner_id;
@@ -185,11 +185,14 @@ bool lvb_telemetry_publish(size_t slot_index, uint32_t instance_id, const struct
 		stats->max_reduction_db,
 		stats->noise_floor_dbfs,
 		stats->fader_smoothness,
+		stats->activity_reentry_speed,
+		stats->loudness_jump_response,
 		stats->quiet_attenuation_db,
 	};
 	for (size_t i = 0; i < LVB_TELEMETRY_STATS_COUNT; i++)
 		atomic_store_u32(&slot->stats[i], float_bits(values[i]));
-	const uint32_t flags = (stats->activity_open ? 1U : 0U) | (stats->bypass ? 2U : 0U);
+	const uint32_t flags = (stats->activity_open ? 1U : 0U) | (stats->bypass ? 2U : 0U) |
+			       (stats->peak_ceiling_limiting ? 4U : 0U) | (stats->max_boost_limiting ? 8U : 0U);
 	atomic_store_u32(&slot->flags, flags);
 	uint32_t sequence = atomic_load_u32(&slot->sequence) + 1U;
 	if (sequence == 0U)
@@ -236,6 +239,8 @@ bool lvb_telemetry_read(size_t slot_index, uint32_t instance_id, struct lvb_tele
 		&snapshot->stats.max_reduction_db,
 		&snapshot->stats.noise_floor_dbfs,
 		&snapshot->stats.fader_smoothness,
+		&snapshot->stats.activity_reentry_speed,
+		&snapshot->stats.loudness_jump_response,
 		&snapshot->stats.quiet_attenuation_db,
 	};
 	for (size_t i = 0; i < LVB_TELEMETRY_STATS_COUNT; i++)
@@ -243,6 +248,8 @@ bool lvb_telemetry_read(size_t slot_index, uint32_t instance_id, struct lvb_tele
 	const uint32_t flags = atomic_load_u32(&slot->flags);
 	snapshot->stats.activity_open = (flags & 1U) != 0U;
 	snapshot->stats.bypass = (flags & 2U) != 0U;
+	snapshot->stats.peak_ceiling_limiting = (flags & 4U) != 0U;
+	snapshot->stats.max_boost_limiting = (flags & 8U) != 0U;
 	atomic_release_lock(&slot->lock);
 	return true;
 }
