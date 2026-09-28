@@ -25,13 +25,15 @@ When an existing installation is upgraded from the service-mode version, its sav
 | Advanced: activity floor | Absolute and relative gate used to keep pauses and room noise from being raised. Range: −100 to −6 dBFS; default: −46 dBFS. |
 | Advanced: reduction attack / gain recovery | Sets smoothing speed for lowering and raising gain. Ranges: 10 to 3000 ms / 50 to 10000 ms; defaults: 180 ms / 1800 ms. |
 
-The compact dock shows each filter instance separately. Its fast IN/OUT bars show channel-linked RMS with 30 ms attack and 150 ms decay. The Qt display refreshes on a precise 16 ms timer; numeric readings retain their K-weighted 400 ms and 3 s rolling windows. Those readings are not integrated-program loudness or ReplayGain normalization. The target and peak ceiling do different jobs: the target guides average level over time, while the peak guard can lower a transient to protect the output.
+The compact dock shows each filter instance separately. The input fast dBFS rail spans −100 to 0 dBFS and marks the configured absolute activity floor; its numeric floor is shown below the title. The relative activity gate can still remain closed above that marker. Output has separate fast dBFS and 400 ms K-weighted LUFS rails, each with its own scale; the rolling target marker and its numeric value appear only on the LUFS rail. A single 400 ms input reading and a paired 3 s input/output reading sit below the rails. These are not integrated-program loudness or ReplayGain normalization. The target and peak ceiling do different jobs: the target guides average level over time, while the peak guard can lower a transient to protect the output.
+
+The gain bar uses a fixed −36 to +36 dB scale centered at zero. It fills from the center to show current signed gain; end labels and marker lines show the active maximum reduction and boost. The large readout repeats the signed gain, while the ↓ attack and ↑ recovery labels show the actual smoothing settings. Peak hold and ceiling remain in a compact summary. Fast IN/OUT bars use channel-linked RMS with 30 ms attack and 150 ms decay. The Qt display refreshes on a precise 16 ms timer, and the rails only repaint when their readings or markers change. When bypass is enabled, the card says **BYPASS** and dims the reference markers; the gain readout stays at its actual 0 dB value.
 
 The room-noise gate uses a fast activity detector, a configurable absolute floor, and a relative reference that follows sustained quieter content. A signal well below the absolute floor cannot open the gate; speech near −35 dBFS can still be lifted. Short transitions can take a fraction of a second for the rolling detector and gain envelope to settle.
 
 The dock reports this filter's input-to-output delay as **IN 0.000 ms** and **OUT +0.125 ms at 48 kHz** or **+0.136 ms at 44.1 kHz** (six samples), calculated from the active OBS audio sample rate. It reports `—` before audio is flowing. This is only the delay added inside this filter; it excludes the audio interface, other OBS buffering or processing, encoding, streaming, and viewer playback. The peak guard uses the same fixed six-sample output delay, a 4x FIR intersample estimate, and a sample ceiling fallback. This implementation has not been certified against the full BS.1770 conformance suite, so the peak reading is an estimate rather than a standards compliance claim.
 
-The audio callback uses fixed-size state, performs no allocation, and does not wait on a lock. Settings are copied through atomics; the dock refreshes its complete stats snapshot on the UI thread.
+The audio callback uses fixed-size state, performs no allocation, and does not wait on a lock. Settings are copied through atomics; each filter publishes its meter readings and effective settings together in one coherent telemetry snapshot for the dock.
 
 ## Build
 
@@ -106,13 +108,15 @@ clang -std=c11 -Wall -Wextra -Wpedantic -Werror -Isrc \
 | 進階：活動底線 | 絕對底線與相對門檻，避免停頓和環境底噪被拉高；範圍 −100 至 −6 dBFS，預設 −46 dBFS。 |
 | 進階：衰減反應／增益恢復 | 設定降低與提高增益的平滑速度；範圍 10–3000／50–10000 毫秒，預設 180／1800 毫秒。 |
 
-緊湊監看面板會為每個濾鏡實例顯示獨立卡片，齒輪按鈕可開啟該濾鏡的設定。IN／OUT 快速跨聲道 RMS 音量表使用 30 毫秒起音與 150 毫秒衰減，Qt 約每 16 毫秒更新；音量表會跟隨即時電平變化。數字仍顯示 K 加權的 400 毫秒與 3 秒滾動響度估算，這些不是整段節目的整合響度，也不是 ReplayGain 正規化。目標響度與峰值上限用途不同：前者引導一段時間內的平均電平，後者在瞬間峰值接近上限時降低輸出。
+緊湊監看面板會為每個濾鏡實例顯示獨立卡片，齒輪按鈕可開啟該濾鏡的設定。輸入快速 dBFS 軌使用 −100 至 0 dBFS 刻度，並在標題下方直接顯示設定的絕對活動底線；即使高過此標記，相對活動門仍可能保持關閉。輸出分成快速 dBFS 軌與 400 毫秒 K 加權 LUFS 軌，各自使用不同刻度；滾動目標標記與數值只出現在 LUFS 軌。軌下只顯示一次輸入 400 毫秒數值，並保留輸入／輸出並列的 3 秒讀值。這些不是整段節目的整合響度，也不是 ReplayGain 正規化。目標響度與峰值上限用途不同：前者引導一段時間內的平均電平，後者在瞬間峰值接近上限時降低輸出。
+
+增益條使用固定 −36 至 +36 dB 刻度，中線為零；填色從中線延伸，表示目前正負增益。兩端文字與標記線顯示實際最大衰減和補償設定，大字再次顯示正負增益；↓ 衰減反應與 ↑ 增益恢復顯示實際平滑設定。峰值保持與上限維持簡短摘要。IN／OUT 快速表使用跨聲道 RMS、30 毫秒起音與 150 毫秒衰減。Qt 約每 16 毫秒更新，數值或標記改變時才重繪音量軌。開啟旁通時，卡片會顯示「旁通」並淡化參考標記；增益讀值仍顯示實際的 0 dB。
 
 環境噪音門使用快速活動偵測、可調絕對底線與會隨持續較小聲內容下移的相對參考。遠低於絕對底線的訊號不會開門；約 −35 dBFS 的小聲講道仍可提升。滾動偵測與增益平滑需要一小段時間才能完成轉換。
 
 面板依實際 OBS 音訊取樣率顯示此濾鏡入口到出口的延遲：輸入 **0.000 毫秒**；輸出在 48 kHz 為 **+0.125 毫秒**，在 44.1 kHz 約 **+0.136 毫秒**（6 個取樣）。尚無音訊流動時顯示 `—`。此數值只計算濾鏡內部延遲，不含音訊介面、OBS 其他緩衝或處理、編碼、串流與觀眾播放。峰值保護使用同一個固定 6 個取樣延遲與 4 倍 FIR 取樣間估算，另以樣本峰值上限作為保護。此實作尚未通過完整 BS.1770 符合性測試，因此峰值讀值是估算，不代表已符合標準。
 
-音訊回呼只使用固定大小狀態、不配置記憶體，也不等待鎖；設定以原子值傳入，監看面板在 UI 執行緒讀取完整統計快照。
+音訊回呼只使用固定大小狀態、不配置記憶體，也不等待鎖；設定以原子值傳入。每個濾鏡實例會將表頭讀值與實際生效設定一起發布為一致的統計快照。
 
 建置方式與 DSP 單元測試指令請參考上方 **Build** 區段。macOS 與 Windows 第一次設定會在 `.deps/` 下載 OBS 開發相依套件與 Qt 6，可能需要數分鐘；Linux 則需先安裝 libobs、obs-frontend-api 與 Qt 6 Widgets 開發套件。
 

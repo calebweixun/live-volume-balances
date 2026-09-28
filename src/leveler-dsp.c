@@ -443,6 +443,11 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	state->stats.true_peak_dbtp = linear_to_db(maximum_output_peak);
 	state->stats.target_lufs = target_lufs;
 	state->stats.peak_ceiling_dbtp = peak_ceiling_db;
+	state->stats.max_boost_db = max_boost_db;
+	state->stats.max_reduction_db = max_reduction_db;
+	state->stats.noise_floor_dbfs = noise_floor_db;
+	state->stats.attack_ms = attack_ms;
+	state->stats.recovery_ms = release_ms;
 	state->stats.sample_rate_hz = sample_rate;
 	if (state->stats.true_peak_dbtp >= state->peak_hold_dbtp) {
 		state->peak_hold_dbtp = state->stats.true_peak_dbtp;
@@ -457,4 +462,5 @@ void lvb_process(struct lvb_state *state, const struct lvb_settings *settings, s
 	state->stats.peak_hold_dbtp = state->peak_hold_dbtp;
 	state->stats.gain_db = settings->bypass ? 0.0f : linear_to_db(last_applied_gain);
 	state->stats.activity_open = state->activity_open;
+	state->stats.bypass = settings->bypass;
 }

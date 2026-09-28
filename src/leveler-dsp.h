@@ -39,8 +39,14 @@ struct lvb_stats {
 	float gain_db;
 	float target_lufs;
 	float peak_ceiling_dbtp;
+	float max_boost_db;
+	float max_reduction_db;
+	float noise_floor_dbfs;
+	float attack_ms;
+	float recovery_ms;
 	float sample_rate_hz;
 	bool activity_open;
+	bool bypass;
 };
 
 struct lvb_biquad_state {
