@@ -387,19 +387,16 @@ public:
 		gain_meta->setContentsMargins(0, 0, 0, 0);
 		gain_meta->setSpacing(4);
 		m_gain_minimum = new QLabel(QStringLiteral("—"), this);
-		m_attack_tag = new QLabel(QStringLiteral("↓ — ms"), this);
-		m_recovery_tag = new QLabel(QStringLiteral("↑ — ms"), this);
+		m_fader_tag = new QLabel(localized("FaderSmoothnessTagUnavailable"), this);
 		m_gain_maximum = new QLabel(QStringLiteral("—"), this);
-		for (QLabel *label : {m_gain_minimum, m_attack_tag, m_recovery_tag, m_gain_maximum})
+		for (QLabel *label : {m_gain_minimum, m_fader_tag, m_gain_maximum})
 			label->setStyleSheet(QStringLiteral("font-size: 11px;"));
 		m_gain_minimum->setToolTip(localized("GainBarHelp"));
 		m_gain_maximum->setToolTip(localized("GainBarHelp"));
-		m_attack_tag->setToolTip(localized("GainAttackTagTooltip"));
-		m_recovery_tag->setToolTip(localized("GainRecoveryTagTooltip"));
+		m_fader_tag->setToolTip(localized("FaderSmoothnessTagTooltip"));
 		gain_meta->addWidget(m_gain_minimum);
 		gain_meta->addStretch(1);
-		gain_meta->addWidget(m_attack_tag);
-		gain_meta->addWidget(m_recovery_tag);
+		gain_meta->addWidget(m_fader_tag);
 		gain_meta->addStretch(1);
 		gain_meta->addWidget(m_gain_maximum);
 		gain_column->addWidget(m_gain_meter);
@@ -472,8 +469,7 @@ public:
 			set_label_text(m_gain_value, localized("MonitorGainUnavailable"));
 			set_label_text(m_gain_minimum, QStringLiteral("—"));
 			set_label_text(m_gain_maximum, QStringLiteral("—"));
-			set_label_text(m_attack_tag, QStringLiteral("↓ — ms"));
-			set_label_text(m_recovery_tag, QStringLiteral("↑ — ms"));
+			set_label_text(m_fader_tag, localized("FaderSmoothnessTagUnavailable"));
 			m_gain_meter->setReading(0.0f, 0.0f, 0.0f);
 			m_gain_meter->setBypassed(false);
 			m_input->setBypassed(false);
@@ -510,8 +506,8 @@ public:
 		set_label_text(m_gain_minimum,
 			       localized("GainRangeMinimumFormat").arg(stats.max_reduction_db, 0, 'f', 1));
 		set_label_text(m_gain_maximum, localized("GainRangeMaximumFormat").arg(stats.max_boost_db, 0, 'f', 1));
-		set_label_text(m_attack_tag, localized("GainAttackTagFormat").arg(stats.attack_ms, 0, 'f', 0));
-		set_label_text(m_recovery_tag, localized("GainRecoveryTagFormat").arg(stats.recovery_ms, 0, 'f', 0));
+		set_label_text(m_fader_tag,
+			       localized("FaderSmoothnessTagFormat").arg(stats.fader_smoothness, 0, 'f', 0));
 		set_label_text(m_peak_summary, localized("MonitorPeakSummaryFormat")
 						       .arg(db_text(stats.peak_hold_dbtp, "dBTP"),
 							    db_text(stats.peak_ceiling_dbtp, "dBTP")));
@@ -558,8 +554,7 @@ private:
 	QLabel *m_gain_value = nullptr;
 	QLabel *m_gain_minimum = nullptr;
 	QLabel *m_gain_maximum = nullptr;
-	QLabel *m_attack_tag = nullptr;
-	QLabel *m_recovery_tag = nullptr;
+	QLabel *m_fader_tag = nullptr;
 	QLabel *m_peak_summary = nullptr;
 	QLabel *m_latency = nullptr;
 	QToolButton *m_settings = nullptr;
