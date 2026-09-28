@@ -35,7 +35,26 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     sudo apt-get install ${apt_args} gcc-${${target##*-}//_/-}-linux-gnu g++-${${target##*-}//_/-}-linux-gnu
   }
 
-  sudo add-apt-repository --yes ppa:obsproject/obs-studio
+  local -i ppa_attempt=1
+  local -i ppa_max_attempts=4
+  local -i ppa_retry_delay
+  while (( ppa_attempt <= ppa_max_attempts )) {
+    if sudo add-apt-repository --yes ppa:obsproject/obs-studio; then
+      break
+    fi
+
+    if (( ppa_attempt == ppa_max_attempts )) {
+      log_error "Could not add the OBS Studio PPA after ${ppa_max_attempts} attempts."
+      log_group
+      return 1
+    }
+
+    ppa_retry_delay=$(( ppa_attempt * 5 ))
+    log_info "Adding the OBS Studio PPA failed on attempt ${ppa_attempt}/${ppa_max_attempts}; retrying in ${ppa_retry_delay}s."
+    sleep ${ppa_retry_delay}
+    (( ppa_attempt++ ))
+  }
+
   sudo apt update
 
   sudo apt-get install ${apt_args} \

@@ -35,6 +35,8 @@ static struct lvb_stats make_stats(float gain, float sample_rate)
 		.noise_floor_dbfs = -46.0f + gain,
 		.attack_ms = 180.0f + gain,
 		.recovery_ms = 1800.0f + gain,
+		.fader_smoothness = 85.0f + gain,
+		.quiet_attenuation_db = 3.0f + gain,
 		.sample_rate_hz = sample_rate,
 		.activity_open = true,
 		.bypass = gain < 0.0f,
@@ -61,7 +63,8 @@ int main(void)
 	      "first instance reads only its own values");
 	CHECK(snapshot.stats.max_boost_db == 20.5f && snapshot.stats.max_reduction_db == 15.5f &&
 		      snapshot.stats.noise_floor_dbfs == -43.5f && snapshot.stats.attack_ms == 182.5f &&
-		      snapshot.stats.recovery_ms == 1802.5f && !snapshot.stats.bypass,
+		      snapshot.stats.recovery_ms == 1802.5f && snapshot.stats.fader_smoothness == 87.5f &&
+		      snapshot.stats.quiet_attenuation_db == 5.5f && !snapshot.stats.bypass,
 	      "first snapshot keeps meter readings and effective control settings together");
 	CHECK(lvb_telemetry_read(5, 202U, &snapshot), "read second instance snapshot");
 	CHECK(snapshot.available && snapshot.stats_available && snapshot.sequence == 1U,
@@ -71,7 +74,8 @@ int main(void)
 	      "second instance reads only its own values");
 	CHECK(snapshot.stats.max_boost_db == 14.0f && snapshot.stats.max_reduction_db == 22.0f &&
 		      snapshot.stats.noise_floor_dbfs == -50.0f && snapshot.stats.attack_ms == 176.0f &&
-		      snapshot.stats.recovery_ms == 1796.0f && snapshot.stats.bypass,
+		      snapshot.stats.recovery_ms == 1796.0f && snapshot.stats.fader_smoothness == 81.0f &&
+		      snapshot.stats.quiet_attenuation_db == -1.0f && snapshot.stats.bypass,
 	      "second snapshot retains its own effective settings and bypass flag");
 
 	CHECK(lvb_telemetry_unregister_slot(2, 101U), "unregister first instance");

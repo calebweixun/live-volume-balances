@@ -17,6 +17,11 @@
 #define LVB_MOMENTARY_BUCKETS 40
 #define LVB_TRUE_PEAK_TAPS 12
 #define LVB_TRUE_PEAK_LATENCY 6
+#define LVB_FADER_SMOOTHNESS_MIN 0.0f
+#define LVB_FADER_SMOOTHNESS_MAX 100.0f
+#define LVB_FADER_SMOOTHNESS_DEFAULT 85.0f
+#define LVB_QUIET_ATTENUATION_MIN 0.0f
+#define LVB_QUIET_ATTENUATION_MAX 12.0f
 
 struct lvb_settings {
 	float target_lufs;
@@ -25,6 +30,8 @@ struct lvb_settings {
 	float attack_ms;
 	float release_ms;
 	float noise_floor_db;
+	float fader_smoothness;
+	float quiet_attenuation_db;
 	float peak_ceiling_db;
 	bool bypass;
 };
@@ -46,6 +53,8 @@ struct lvb_stats {
 	float noise_floor_dbfs;
 	float attack_ms;
 	float recovery_ms;
+	float fader_smoothness;
+	float quiet_attenuation_db;
 	float sample_rate_hz;
 	bool activity_open;
 	bool bypass;
@@ -71,16 +80,23 @@ struct lvb_meter_state {
 
 /* Fixed-size state: processing audio never allocates or waits on a lock. */
 struct lvb_state {
-	float gain;
+	double gain;
+	double gain_db;
+	double gain_target_db;
+	float gain_rate_db_per_second;
 	float peak_guard_gain;
 	float activity_gain;
+	float quiet_gain;
 	float sample_rate;
 	float activity_energy_coefficient;
 	float activity_gain_coefficient;
+	float quiet_gain_attack_coefficient;
+	float quiet_gain_release_coefficient;
 	float fast_meter_attack_coefficient;
 	float fast_meter_release_coefficient;
 	float activity_reference_dbfs;
 	float activity_hold_seconds;
+	float quiet_transition_seconds;
 	float peak_hold_dbtp;
 	float peak_hold_seconds;
 	double activity_energy;
