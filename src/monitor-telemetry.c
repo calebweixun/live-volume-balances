@@ -16,7 +16,7 @@ typedef volatile LONG lvb_atomic_uint32_t;
 typedef _Atomic(uint32_t) lvb_atomic_uint32_t;
 #endif
 
-#define LVB_TELEMETRY_STATS_COUNT 19
+#define LVB_TELEMETRY_STATS_COUNT 17
 
 struct lvb_telemetry_slot {
 	lvb_atomic_uint32_t owner_id;
@@ -184,8 +184,6 @@ bool lvb_telemetry_publish(size_t slot_index, uint32_t instance_id, const struct
 		stats->max_boost_db,
 		stats->max_reduction_db,
 		stats->noise_floor_dbfs,
-		stats->attack_ms,
-		stats->recovery_ms,
 		stats->fader_smoothness,
 		stats->quiet_attenuation_db,
 	};
@@ -237,8 +235,6 @@ bool lvb_telemetry_read(size_t slot_index, uint32_t instance_id, struct lvb_tele
 		&snapshot->stats.max_boost_db,
 		&snapshot->stats.max_reduction_db,
 		&snapshot->stats.noise_floor_dbfs,
-		&snapshot->stats.attack_ms,
-		&snapshot->stats.recovery_ms,
 		&snapshot->stats.fader_smoothness,
 		&snapshot->stats.quiet_attenuation_db,
 	};

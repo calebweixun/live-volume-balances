@@ -27,8 +27,6 @@ struct lvb_settings {
 	float target_lufs;
 	float max_boost_db;
 	float max_reduction_db;
-	float attack_ms;
-	float release_ms;
 	float noise_floor_db;
 	float fader_smoothness;
 	float quiet_attenuation_db;
@@ -51,8 +49,6 @@ struct lvb_stats {
 	float max_boost_db;
 	float max_reduction_db;
 	float noise_floor_dbfs;
-	float attack_ms;
-	float recovery_ms;
 	float fader_smoothness;
 	float quiet_attenuation_db;
 	float sample_rate_hz;
@@ -85,15 +81,13 @@ struct lvb_state {
 	double gain_target_db;
 	float gain_rate_db_per_second;
 	float peak_guard_gain;
-	float activity_gain;
-	float quiet_gain;
 	float sample_rate;
 	float activity_energy_coefficient;
-	float activity_gain_coefficient;
-	float quiet_gain_attack_coefficient;
-	float quiet_gain_release_coefficient;
 	float fast_meter_attack_coefficient;
 	float fast_meter_release_coefficient;
+	float peak_envelope_attack_coefficient;
+	float peak_envelope_release_coefficient;
+	float input_peak_envelope;
 	float activity_reference_dbfs;
 	float activity_hold_seconds;
 	float quiet_transition_seconds;

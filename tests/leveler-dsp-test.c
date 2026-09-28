@@ -24,8 +24,6 @@ static struct lvb_settings test_settings(void)
 		.target_lufs = -18.0f,
 		.max_boost_db = 18.0f,
 		.max_reduction_db = 18.0f,
-		.attack_ms = 180.0f,
-		.release_ms = 1800.0f,
 		.noise_floor_db = -46.0f,
 		.fader_smoothness = LVB_FADER_SMOOTHNESS_DEFAULT,
 		.quiet_attenuation_db = 0.0f,
@@ -119,6 +117,52 @@ static float process_noise_segment(struct lvb_state *state, const struct lvb_set
 	return output_count ? (float)sqrt(output_sum / (double)output_count) : 0.0f;
 }
 
+static float process_sermon_with_room_noise(struct lvb_state *state, const struct lvb_settings *settings,
+					    size_t first_frame, size_t frames, bool voice_active, float voice_amplitude,
+					    float noise_amplitude, float *maximum_gain_step_db,
+					    float *maximum_peak_dbtp)
+{
+	float samples[521];
+	float *planes[] = {samples};
+	const float sample_rate = 48000.0f;
+	const size_t block_sizes[] = {137, 511, 233, 89, 521, 317};
+	size_t position = 0;
+	size_t block_index = 0;
+	double output_energy = 0.0;
+	float previous_gain_db = state->stats.gain_db;
+	if (maximum_gain_step_db)
+		*maximum_gain_step_db = 0.0f;
+	while (position < frames) {
+		const size_t requested_count =
+			block_sizes[block_index++ % (sizeof(block_sizes) / sizeof(block_sizes[0]))];
+		const size_t count = requested_count < frames - position ? requested_count : frames - position;
+		for (size_t i = 0; i < count; i++) {
+			const size_t frame = first_frame + position + i;
+			const float time = (float)frame / sample_rate;
+			const float voice =
+				voice_active
+					? voice_amplitude * (0.72f * sinf(6.28318530717958647692f * 180.0f * time) +
+							     0.20f * sinf(6.28318530717958647692f * 370.0f * time) +
+							     0.08f * sinf(6.28318530717958647692f * 820.0f * time))
+					: 0.0f;
+			samples[i] = voice + noise_value(frame, noise_amplitude);
+		}
+		lvb_process(state, settings, 1, planes, count, sample_rate);
+		if (maximum_gain_step_db) {
+			const float step = fabsf(state->stats.gain_db - previous_gain_db);
+			if (step > *maximum_gain_step_db)
+				*maximum_gain_step_db = step;
+		}
+		previous_gain_db = state->stats.gain_db;
+		if (maximum_peak_dbtp && state->stats.true_peak_dbtp > *maximum_peak_dbtp)
+			*maximum_peak_dbtp = state->stats.true_peak_dbtp;
+		for (size_t i = 0; i < count; i++)
+			output_energy += (double)samples[i] * samples[i];
+		position += count;
+	}
+	return frames ? (float)sqrt(output_energy / (double)frames) : 0.0f;
+}
+
 static float mixed_syllable_gain_swing(float smoothness, float *maximum_peak_dbtp,
 				       float *maximum_quiet_transition_seconds)
 {
@@ -159,10 +203,12 @@ static float mixed_syllable_gain_swing(float smoothness, float *maximum_peak_dbt
 				samples[i] = music + voice;
 			}
 			lvb_process(&state, &settings, 1, planes, count, 48000.0f);
-			if (state.gain_db < minimum_gain_db)
-				minimum_gain_db = state.gain_db;
-			if (state.gain_db > maximum_gain_db)
-				maximum_gain_db = state.gain_db;
+			if (cycle_position < 48000U / 5U) {
+				if (state.gain_db < minimum_gain_db)
+					minimum_gain_db = state.gain_db;
+				if (state.gain_db > maximum_gain_db)
+					maximum_gain_db = state.gain_db;
+			}
 			if (maximum_peak_dbtp && state.stats.true_peak_dbtp > *maximum_peak_dbtp)
 				*maximum_peak_dbtp = state.stats.true_peak_dbtp;
 			if (maximum_quiet_transition_seconds &&
@@ -225,8 +271,8 @@ static int test_full_band_to_quiet_sermon_reopens_relative_gate(void)
 	const float sermon_rms =
 		process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U, 48000U / 2U, NULL);
 	CHECK(state.stats.input_momentary_lufs > -40.0f, "quiet sermon should remain above the activity floor");
-	CHECK(gain_after_half_second > gain_during_band && gain_after_one_second > gain_after_half_second,
-	      "quiet-sermon gain should start rising smoothly rather than jump at the transition");
+	CHECK(gain_after_half_second >= gain_during_band - 0.5f && gain_after_one_second > gain_during_band,
+	      "peak headroom may briefly hold the fader after the band, then quiet-sermon gain should rise smoothly");
 	CHECK(quiet_timer_after_one_second < 0.80f && quiet_timer_after_two_seconds >= 0.80f,
 	      "faster quiet-transition assist should require sustained active low-level audio");
 	CHECK(state.stats.gain_db > 3.0f,
@@ -320,28 +366,57 @@ static int test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely(void)
 	return 0;
 }
 
-static int test_short_pauses_do_not_lift_minus_50_dbfs_ambience(void)
+static int test_speech_gaps_hold_fader_and_floor_plus_two_does_not_reopen(void)
 {
 	struct lvb_settings settings = test_settings();
+	settings.target_lufs = -10.0f;
+	settings.max_boost_db = 17.0f;
+	settings.max_reduction_db = 12.5f;
+	settings.noise_floor_db = -50.0f;
+	settings.fader_smoothness = 85.0f;
+	settings.quiet_attenuation_db = 3.0f;
+	settings.peak_ceiling_db = -7.1f;
 	struct lvb_state state;
 	lvb_state_init(&state);
-	process_segment(&state, &settings, 48000.0f, 440.0f, 0.035f, 48000U * 2U, 0, NULL);
-	CHECK(state.stats.gain_db > 3.0f, "speech before a pause should have audible automatic lift");
-
-	/* Deterministic broadband noise at about -50 dBFS models room ambience. */
-	float pause_peak = -120.0f;
-	const float first_half_rms =
-		process_noise_segment(&state, &settings, 48000.0f, 0.0055f, 24000U, 0, &pause_peak);
-	const float second_half_rms =
-		process_noise_segment(&state, &settings, 48000.0f, 0.0055f, 72000U, 48000U, &pause_peak);
-	CHECK(!state.stats.activity_open, "the absolute activity floor should close during a quiet pause");
-	CHECK(state.stats.input_momentary_lufs < settings.noise_floor_db,
-	      "broadband -50 dBFS room noise should sit below the default activity floor");
+	float maximum_peak = -120.0f;
+	process_sermon_with_room_noise(&state, &settings, 0, 48000U * 4U, true, 0.025f, 0.0069f, NULL, &maximum_peak);
+	CHECK(state.stats.gain_db > 8.0f, "quiet sermon should receive a useful lift before short phrase gaps");
+	const float gain_before_short_gap = state.stats.gain_db;
+	const float first_pause_rms = process_sermon_with_room_noise(&state, &settings, 48000U * 4U, 48000U * 3U / 10U,
+								     false, 0.0f, 0.0069f, NULL, &maximum_peak);
+	CHECK(fabsf(state.stats.gain_db - gain_before_short_gap) < 0.35f,
+	      "a 300 ms speech gap should hold the same fader position instead of quickly cancelling boost");
+	CHECK(fabs((double)state.gain_target_db - state.gain_db) < 0.02,
+	      "the fader destination should freeze at its current position through a short word gap");
+	process_sermon_with_room_noise(&state, &settings, 48000U * 4U + 48000U * 3U / 10U, 48000U / 4U, true, 0.025f,
+				       0.0069f, NULL, &maximum_peak);
+	const float gain_before_longer_gap = state.stats.gain_db;
+	const float second_pause_rms =
+		process_sermon_with_room_noise(&state, &settings, 48000U * 4U + 48000U * 3U / 10U + 48000U / 4U, 48000U,
+					       false, 0.0f, 0.0069f, NULL, &maximum_peak);
+	CHECK(fabsf(state.stats.gain_db - gain_before_longer_gap) < 0.45f,
+	      "a one-second inter-phrase pause should remain inside the fader hold interval");
+	CHECK(first_pause_rms > 0.0f && second_pause_rms > 0.0f &&
+		      fabsf(20.0f * log10f(second_pause_rms / first_pause_rms)) < 1.5f,
+	      "room tone should remain at a similar level across short gaps instead of repeatedly appearing and disappearing");
+	CHECK(state.stats.activity_open, "the one-second pause should remain inside the 1.2-second activity hold");
 	CHECK(state.quiet_transition_seconds < 0.80f,
-	      "a closed room-noise pause should not qualify for the active quiet-transition assist");
-	CHECK(first_half_rms < 0.0048f, "the first half-second pause should not pull room ambience toward target");
-	CHECK(second_half_rms < 0.0037f, "a sustained pause must remain near its original ambience level");
-	CHECK(pause_peak <= settings.peak_ceiling_db + 0.35f, "peak protection must remain safe during a pause");
+	      "room tone below the floor should not trigger the active quiet-sermon recovery assist");
+	process_sermon_with_room_noise(&state, &settings, 48000U * 5U + 48000U * 55U / 100U, 48000U * 6U, false, 0.0f,
+				       0.0069f, NULL, &maximum_peak);
+	CHECK(fabsf(state.stats.gain_db + settings.quiet_attenuation_db) < 0.5f,
+	      "after a long pause the same fader should settle at the configured quiet attenuation");
+	CHECK(!state.stats.activity_open,
+	      "noise at about two dB above the absolute floor must not re-open the activity gate");
+	const float gain_before_reentry = state.stats.gain_db;
+	float maximum_reentry_step = 0.0f;
+	process_sermon_with_room_noise(&state, &settings, 48000U * 11U + 48000U * 55U / 100U, 48000U * 3U / 10U, true,
+				       0.025f, 0.0069f, &maximum_reentry_step, &maximum_peak);
+	CHECK(state.stats.gain_db > gain_before_reentry,
+	      "speech should smoothly resume gain riding after long quiet attenuation");
+	CHECK(maximum_reentry_step < 0.35f, "reopening the gate should not create a callback-sized gain jump");
+	CHECK(maximum_peak <= settings.peak_ceiling_db + 0.35f,
+	      "peak protection remains active through speech pauses and re-entry");
 	return 0;
 }
 
@@ -355,12 +430,80 @@ static int test_optional_quiet_attenuation_fades_without_hard_gating(void)
 	CHECK(state.stats.gain_db > 3.0f, "speech before a pause should receive automatic lift");
 	const float input_noise_rms = 0.0055f / sqrtf(3.0f);
 	const float output_noise_rms =
-		process_noise_segment(&state, &settings, 48000.0f, 0.0055f, 48000U * 2U, 48000U, NULL);
+		process_noise_segment(&state, &settings, 48000.0f, 0.0055f, 48000U * 6U, 48000U * 5U, NULL);
 	CHECK(!state.stats.activity_open, "the activity gate should close during room ambience");
-	CHECK(state.stats.quiet_attenuation_db == 6.0f && state.stats.gain_db < -5.0f,
-	      "quiet attenuation should smoothly reach its configured level after the gate closes");
-	CHECK(output_noise_rms < input_noise_rms * 0.62f && output_noise_rms > input_noise_rms * 0.25f,
-	      "room ambience should fade down without being hard-muted");
+	CHECK(state.stats.quiet_attenuation_db == 6.0f && fabsf(state.stats.gain_db + 6.0f) < 0.5f,
+	      "quiet attenuation should be the settled endpoint of the same fader after a long hold");
+	CHECK(output_noise_rms < input_noise_rms * 0.58f && output_noise_rms > input_noise_rms * 0.38f,
+	      "room ambience should settle near the selected attenuation without being hard-muted");
+	return 0;
+}
+
+static int test_ambiguous_room_noise_does_not_extend_activity_hangover(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.target_lufs = -10.0f;
+	settings.max_boost_db = 17.0f;
+	settings.max_reduction_db = 12.5f;
+	settings.noise_floor_db = -50.0f;
+	settings.quiet_attenuation_db = 3.0f;
+	settings.peak_ceiling_db = -7.1f;
+	struct lvb_state state;
+	lvb_state_init(&state);
+	process_sermon_with_room_noise(&state, &settings, 0, 48000U * 2U, true, 0.025f, 0.0f, NULL, NULL);
+	CHECK(state.stats.activity_open && state.stats.gain_db > 3.0f,
+	      "speech should open the activity gate and establish a boosted fader position");
+	const float gain_after_speech = state.stats.gain_db;
+	const float ambiguous_noise_amplitude = db_to_linear(-45.0f) * sqrtf(3.0f);
+	process_noise_segment(&state, &settings, 48000.0f, ambiguous_noise_amplitude, 48000U * 8U / 10U, 0, NULL);
+	CHECK(state.stats.activity_open,
+	      "ambience above the floor but below the opening threshold should retain the normal speech hangover briefly");
+	process_noise_segment(&state, &settings, 48000.0f, ambiguous_noise_amplitude, 48000U * 5U, 0, NULL);
+	CHECK(!state.stats.activity_open,
+	      "steady −45 dBFS ambience above the floor must not reset the 1.2-second hold indefinitely");
+	CHECK(state.stats.gain_db < gain_after_speech - 2.0f,
+	      "after the hold expires, sustained ambiguous ambience should let the fader leave its old boosted position");
+	const float gain_after_close = state.stats.gain_db;
+	process_noise_segment(&state, &settings, 48000.0f, ambiguous_noise_amplitude, 48000U * 2U, 0, NULL);
+	CHECK(!state.stats.activity_open && fabsf(state.stats.gain_db - gain_after_close) < 0.25f,
+	      "ambience below the opening threshold should not repeatedly reopen the gate or restart the fader ramp");
+	return 0;
+}
+
+static int test_brief_phrase_freezes_current_fader_through_room_tone(void)
+{
+	struct lvb_settings settings = test_settings();
+	settings.target_lufs = -10.0f;
+	settings.max_boost_db = 17.0f;
+	settings.max_reduction_db = 12.5f;
+	settings.noise_floor_db = -50.0f;
+	settings.fader_smoothness = 85.0f;
+	settings.quiet_attenuation_db = 3.0f;
+	settings.peak_ceiling_db = -7.1f;
+	struct lvb_state state;
+	lvb_state_init(&state);
+	process_sermon_with_room_noise(&state, &settings, 0, 48000U / 5U, true, 0.025f, 0.0069f, NULL, NULL);
+	CHECK(state.stats.activity_open, "a brief sermon phrase should open the activity gate");
+	const float gain_after_phrase = state.stats.gain_db;
+	CHECK(state.gain_target_db > state.gain_db + 0.5,
+	      "the brief phrase should end with an unfinished upward fader ramp for the pause test to exercise");
+	float pause_gain_step = 0.0f;
+	process_sermon_with_room_noise(&state, &settings, 48000U / 5U, 48000U, false, 0.0f, 0.0069f, &pause_gain_step,
+				       NULL);
+	CHECK(state.stats.activity_open, "a one-second room-tone gap should remain inside the hold interval");
+	CHECK(fabsf(state.stats.gain_db - gain_after_phrase) < 0.10f && pause_gain_step < 0.10f,
+	      "a short phrase must freeze the actual fader position so room tone does not keep rising in the pause");
+	CHECK(fabs(state.gain_target_db - state.gain_db) < 0.02,
+	      "a brief phrase pause should freeze the target at the actual fader position, not keep its unfinished destination");
+	CHECK(fabsf(state.gain_rate_db_per_second) < 1e-5f,
+	      "the fader rate should stop while its current position is held between phrases");
+	float reentry_gain_step = 0.0f;
+	process_sermon_with_room_noise(&state, &settings, 48000U * 6U / 5U, 48000U / 5U, true, 0.025f, 0.0069f,
+				       &reentry_gain_step, NULL);
+	CHECK(state.stats.gain_db > gain_after_phrase,
+	      "the fader should resume toward the loudness target when speech returns");
+	CHECK(reentry_gain_step < 0.20f,
+	      "speech re-entry should begin moving from the held position without a block-boundary jump");
 	return 0;
 }
 
@@ -378,7 +521,7 @@ static int test_activity_gate_transition_is_smoothed(void)
 	CHECK(state.stats.gain_db > 5.0f, "speech should establish meaningful upward gain before the pause");
 	float previous_gain = state.stats.gain_db;
 	float maximum_gain_step = 0.0f;
-	for (size_t block = 0; block < 100; block++) {
+	for (size_t block = 0; block < 180; block++) {
 		fill_sine(samples, 480, 48000.0f, 310.0f, 0.0045f, block * 480, 0.23f);
 		lvb_process(&state, &settings, 1, planes, 480, 48000.0f);
 		const float gain_step = fabsf(state.stats.gain_db - previous_gain);
@@ -386,8 +529,8 @@ static int test_activity_gate_transition_is_smoothed(void)
 			maximum_gain_step = gain_step;
 		previous_gain = state.stats.gain_db;
 	}
-	CHECK(maximum_gain_step < 4.0f,
-	      "activity closure should fade boosted allowance instead of stepping abruptly to unity");
+	CHECK(maximum_gain_step < 0.35f,
+	      "activity closure should move the dB fader gradually instead of stepping abruptly");
 	CHECK(!state.stats.activity_open, "gate transition should settle closed during the ambience");
 	return 0;
 }
@@ -408,13 +551,13 @@ static int test_stereo_room_noise_uses_per_channel_activity_floor(void)
 	CHECK(state.stats.gain_db > 5.0f, "quiet stereo speech should receive automatic compensation");
 	double output_energy = 0.0;
 	size_t output_frames = 0;
-	for (size_t block = 0; block < 50; block++) {
+	for (size_t block = 0; block < 350; block++) {
 		for (size_t i = 0; i < 480; i++) {
 			left[i] = noise_value(block * 480U + i, 0.0055f);
 			right[i] = noise_value(block * 480U + i + 91021U, 0.0055f);
 		}
 		lvb_process(&state, &settings, 2, planes, 480, 48000.0f);
-		if (block >= 25) {
+		if (block >= 300) {
 			for (size_t i = 0; i < 480; i++) {
 				output_energy += (double)left[i] * left[i] + (double)right[i] * right[i];
 				output_frames += 2;
@@ -423,7 +566,7 @@ static int test_stereo_room_noise_uses_per_channel_activity_floor(void)
 	}
 	const float output_rms = (float)sqrt(output_energy / (double)output_frames);
 	CHECK(!state.stats.activity_open, "two-channel -50 dBFS room ambience must not open the activity gate");
-	CHECK(output_rms < 0.0048f, "stereo room noise should remain near its input level during a pause");
+	CHECK(output_rms < 0.0048f, "stereo room noise should settle near its input level after the fader hold");
 	return 0;
 }
 
@@ -562,7 +705,6 @@ static int test_expanded_control_ranges_are_effective(void)
 	settings.target_lufs = LVB_TARGET_LUFS_MAX;
 	settings.max_boost_db = 36.0f;
 	settings.max_reduction_db = 36.0f;
-	settings.release_ms = 50.0f;
 	settings.noise_floor_db = -100.0f;
 	settings.peak_ceiling_db = 0.0f;
 	struct lvb_state quiet_state;
@@ -586,7 +728,7 @@ static int test_expanded_control_ranges_are_effective(void)
 
 	settings.target_lufs = LVB_TARGET_LUFS_MIN;
 	settings.max_boost_db = 0.0f;
-	settings.attack_ms = 10.0f;
+	settings.fader_smoothness = LVB_FADER_SMOOTHNESS_MIN;
 	struct lvb_state loud_state;
 	lvb_state_init(&loud_state);
 	process_segment(&loud_state, &settings, 48000.0f, 900.0f, 0.80f, 48000U * 4U, 0, NULL);
@@ -599,7 +741,7 @@ static int test_expanded_control_ranges_are_effective(void)
 	settings.noise_floor_db = -100.0f;
 	struct lvb_state floor_state;
 	lvb_state_init(&floor_state);
-	process_segment(&floor_state, &settings, 48000.0f, 900.0f, 0.000025f, 48000U / 10U, 0, NULL);
+	process_segment(&floor_state, &settings, 48000.0f, 900.0f, 0.00004f, 48000U / 10U, 0, NULL);
 	CHECK(floor_state.stats.activity_open, "-100 dBFS activity-floor endpoint allows a very quiet signal");
 
 	settings.max_boost_db = 0.0f;
@@ -613,38 +755,22 @@ static int test_expanded_control_ranges_are_effective(void)
 	      "-24 dBTP estimated ceiling endpoint is accepted by DSP");
 	CHECK(measured_peak < db_to_linear(-23.8f), "minimum peak-ceiling range is enforced on output samples");
 
-	struct lvb_settings attack_settings = test_settings();
-	attack_settings.fader_smoothness = 0.0f;
-	attack_settings.target_lufs = -36.0f;
-	attack_settings.max_boost_db = 0.0f;
-	attack_settings.max_reduction_db = 36.0f;
-	attack_settings.noise_floor_db = -100.0f;
-	attack_settings.peak_ceiling_db = 0.0f;
-	attack_settings.attack_ms = 10.0f;
-	struct lvb_state fast_attack_state;
-	lvb_state_init(&fast_attack_state);
-	process_segment(&fast_attack_state, &attack_settings, 48000.0f, 900.0f, 0.8f, 480U, 0, NULL);
-	attack_settings.attack_ms = 20.0f;
-	struct lvb_state slower_attack_state;
-	lvb_state_init(&slower_attack_state);
-	process_segment(&slower_attack_state, &attack_settings, 48000.0f, 900.0f, 0.8f, 480U, 0, NULL);
-	CHECK(fast_attack_state.stats.gain_db < slower_attack_state.stats.gain_db - 1.0f,
-	      "10 ms attack endpoint responds faster than 20 ms, below the legacy 20 ms minimum");
-
-	struct lvb_settings recovery_settings = test_settings();
-	recovery_settings.fader_smoothness = 0.0f;
-	recovery_settings.max_boost_db = 18.0f;
-	recovery_settings.noise_floor_db = -100.0f;
-	recovery_settings.release_ms = 10000.0f;
-	struct lvb_state slow_recovery_state;
-	lvb_state_init(&slow_recovery_state);
-	process_segment(&slow_recovery_state, &recovery_settings, 48000.0f, 900.0f, 0.035f, 48000U * 2U, 0, NULL);
-	recovery_settings.release_ms = 5000.0f;
-	struct lvb_state faster_recovery_state;
-	lvb_state_init(&faster_recovery_state);
-	process_segment(&faster_recovery_state, &recovery_settings, 48000.0f, 900.0f, 0.035f, 48000U * 2U, 0, NULL);
-	CHECK(faster_recovery_state.stats.gain_db > slow_recovery_state.stats.gain_db + 0.6f,
-	      "10000 ms recovery endpoint is slower than 5000 ms, above the legacy 5000 ms maximum");
+	struct lvb_settings fast_fader_settings = test_settings();
+	fast_fader_settings.fader_smoothness = LVB_FADER_SMOOTHNESS_MIN;
+	fast_fader_settings.target_lufs = -36.0f;
+	fast_fader_settings.max_boost_db = 0.0f;
+	fast_fader_settings.max_reduction_db = 36.0f;
+	fast_fader_settings.noise_floor_db = -100.0f;
+	fast_fader_settings.peak_ceiling_db = 0.0f;
+	struct lvb_state fast_fader_state;
+	lvb_state_init(&fast_fader_state);
+	process_segment(&fast_fader_state, &fast_fader_settings, 48000.0f, 900.0f, 0.8f, 48000U / 2U, 0, NULL);
+	fast_fader_settings.fader_smoothness = LVB_FADER_SMOOTHNESS_MAX;
+	struct lvb_state smooth_fader_state;
+	lvb_state_init(&smooth_fader_state);
+	process_segment(&smooth_fader_state, &fast_fader_settings, 48000.0f, 900.0f, 0.8f, 48000U / 2U, 0, NULL);
+	CHECK(fast_fader_state.stats.gain_db < smooth_fader_state.stats.gain_db - 4.0f,
+	      "smoothness 0 should move the main gain faster than smoothness 100");
 	return 0;
 }
 
@@ -671,8 +797,13 @@ int main(void)
 	      "small per-sample gain steps preserve linear and dB precision");
 	CHECK(test_quiet_sermon_to_loud_band_reduces_smoothly_and_safely() == 0,
 	      "quiet sermon to full-band transition");
-	CHECK(test_short_pauses_do_not_lift_minus_50_dbfs_ambience() == 0, "pause and room-noise gate");
+	CHECK(test_speech_gaps_hold_fader_and_floor_plus_two_does_not_reopen() == 0,
+	      "short speech gaps, held fader, quiet endpoint and noise-floor behavior");
+	CHECK(test_ambiguous_room_noise_does_not_extend_activity_hangover() == 0,
+	      "ambiguous room noise cannot hold activity open indefinitely");
 	CHECK(test_optional_quiet_attenuation_fades_without_hard_gating() == 0, "optional quiet-period attenuation");
+	CHECK(test_brief_phrase_freezes_current_fader_through_room_tone() == 0,
+	      "brief phrase holds the current fader through room tone");
 	CHECK(test_activity_gate_transition_is_smoothed() == 0, "smooth activity gate closure");
 	CHECK(test_stereo_room_noise_uses_per_channel_activity_floor() == 0, "stereo activity floor");
 	CHECK(test_fir_peak_guard_and_meter_at_44100_and_48000() == 0, "4x FIR guard at 44.1 and 48 kHz");
