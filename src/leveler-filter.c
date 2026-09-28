@@ -181,7 +181,7 @@ size_t lvb_monitor_list_sources(struct lvb_monitor_source *sources, size_t capac
 			sources[count].telemetry_slot = filter->telemetry_slot;
 			const char *name = filter->parent_source_name;
 			if (name[0] != '\0')
-				snprintf(sources[count].name, sizeof(sources[count].name), "%s (#%u)", name,
+				snprintf(sources[count].name, sizeof(sources[count].name), "%.113s (#%u)", name,
 					 filter->instance_id);
 			else
 				snprintf(sources[count].name, sizeof(sources[count].name), "Audio source #%u",
